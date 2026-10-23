@@ -677,6 +677,7 @@ mod tests {
             session_id_header_override: None,
             timeout_seconds: None,
             supports_streaming: None,
+            disable_responses_api: false,
             requires_auth: false,
             catalog_provider_id: None,
             base_path: None,

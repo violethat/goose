@@ -51,7 +51,7 @@ lru = { version = "0.18", default-features = false }
 once_cell = { version = "1.21.3", default-features = false, features = ["std"] }
 rand = "0.10.1"
 regex = { version = "1.12.3", default-features = false, features = ["std"] }
-reqwest = { version = "0.13.2", default-features = false, features = ["multipart", "form"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["multipart", "form", "system-proxy", "socks"] }
 rustls = { version = "0.23.31", default-features = false, features = ["aws_lc_rs", "std"] }
 schemars = { version = "1.0.2", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }

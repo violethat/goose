@@ -32,6 +32,7 @@ pub(crate) mod declarative_providers {
         inception,
         ionet,
         lemonade,
+        liara,
         llama_swap,
         lmstudio,
         lynkr,
@@ -51,6 +52,7 @@ pub(crate) mod declarative_providers {
         ovhcloud,
         perplexity,
         pleumrouter,
+        qubax,
         routerplex,
         routstr,
         sakana,
@@ -167,6 +169,11 @@ pub struct DeclarativeProviderConfig {
     pub session_id_header_override: Option<String>,
     pub timeout_seconds: Option<u64>,
     pub supports_streaming: Option<bool>,
+    /// Some OpenAI-compatible gateways implement only Chat Completions. Goose
+    /// routes gpt-5*/gpt-6*/o*-style model names to the Responses API by
+    /// default; set true to keep every model on Chat Completions instead.
+    #[serde(default)]
+    pub disable_responses_api: bool,
     #[serde(default = "default_requires_auth")]
     pub requires_auth: bool,
     #[serde(default)]
