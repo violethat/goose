@@ -31,6 +31,7 @@ use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -140,6 +141,13 @@ pub struct OpenAiProvider {
     skip_canonical_filtering: bool,
     preserve_thinking_context: bool,
     native_openai: bool,
+    /// Gateways that only implement Chat Completions never route to the
+    /// Responses API, regardless of the model name.
+    disable_responses_api: bool,
+    /// Models whose gateway rejected the `developer` system role; these are
+    /// built with the `system` role from the first attempt onwards.
+    #[serde(skip)]
+    demoted_role_models: Arc<Mutex<std::collections::HashSet<String>>>,
     #[serde(skip)]
     session_id_provider: Option<OpenAiSessionIdProvider>,
     #[serde(skip)]
@@ -174,6 +182,8 @@ pub struct OpenAiProviderBuilder {
     preserve_thinking_context: bool,
     session_id_provider: Option<OpenAiSessionIdProvider>,
     native_openai: bool,
+    disable_responses_api: bool,
+    demoted_role_models: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl OpenAiProviderBuilder {
@@ -192,6 +202,8 @@ impl OpenAiProviderBuilder {
             preserve_thinking_context: false,
             session_id_provider: None,
             native_openai: false,
+            disable_responses_api: false,
+            demoted_role_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -273,6 +285,13 @@ impl OpenAiProviderBuilder {
         self
     }
 
+    /// Force Chat Completions for every model, even names that would
+    /// normally be routed to the Responses API.
+    pub fn disable_responses_api(mut self, disable_responses_api: bool) -> Self {
+        self.disable_responses_api = disable_responses_api;
+        self
+    }
+
     pub fn build(self) -> OpenAiProvider {
         OpenAiProvider {
             api_client: self.api_client,
@@ -288,6 +307,8 @@ impl OpenAiProviderBuilder {
             preserve_thinking_context: self.preserve_thinking_context,
             session_id_provider: self.session_id_provider,
             native_openai: self.native_openai,
+            disable_responses_api: self.disable_responses_api,
+            demoted_role_models: self.demoted_role_models,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -420,6 +441,8 @@ impl OpenAiProvider {
             preserve_thinking_context: false,
             session_id_provider: None,
             native_openai: false,
+            disable_responses_api: false,
+            demoted_role_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -576,6 +599,10 @@ impl OpenAiProvider {
     }
 
     fn should_use_responses_api_for_provider(&self, model_name: &str) -> bool {
+        if self.disable_responses_api {
+            return false;
+        }
+
         if Self::PROVIDERS_NEEDING_STANDARD_CHAT_PARAMS.contains(&self.name.as_str()) {
             return false;
         }
@@ -656,6 +683,47 @@ impl OpenAiProvider {
             }
         })?;
         Ok(parse_n_ctx_from_models(&json, model_name))
+    }
+}
+
+/// Errors produced by gateways/upstreams that reject OpenAI's `developer`
+/// system role on Chat Completions (common on relays that proxy models from
+/// several vendors; some upstreams only accept `system`). Matching the exact
+/// upstream text is fragile, so accept a few well-known phrasings that all
+/// refer to the role itself.
+fn is_role_rejection(error: &ProviderError) -> bool {
+    let ProviderError::RequestFailed(message) = error else {
+        return false;
+    };
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("developer is not one of")
+        || lowered.contains("incorrect role")
+        || (lowered.contains("developer")
+            && lowered.contains("role")
+            && (lowered.contains("invalid")
+                || lowered.contains("not supported")
+                || lowered.contains("unknown")
+                || lowered.contains("unrecognized")))
+}
+
+/// Rewrite the system-prompt message from OpenAI's `developer` role to the
+/// universally supported `system` role.
+fn demote_developer_role(payload: &mut serde_json::Value) {
+    let Some(messages) = payload
+        .get_mut("messages")
+        .and_then(|messages| messages.as_array_mut())
+    else {
+        return;
+    };
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(|role| role.as_str()) == Some("developer") {
+            if let Some(object) = message.as_object_mut() {
+                object.insert(
+                    "role".to_string(),
+                    serde_json::Value::String("system".to_string()),
+                );
+            }
+        }
     }
 }
 
@@ -878,19 +946,52 @@ impl Provider for OpenAiProvider {
                 apply_declared_request_params(&mut payload, params);
             }
 
-            let payload = self.sanitize_request_for_compat(payload, model_config);
+            let mut payload = self.sanitize_request_for_compat(payload, model_config);
             let mut log = start_log(model_config, &payload)?;
 
+            // Some gateways reject OpenAI's `developer` system role with a 4xx
+            // ("developer is not one of [...]", "Incorrect role information.").
+            // Retry once with the role demoted to `system` before giving up,
+            // and remember the demotion so later requests skip the failed try.
+            let already_demoted = self
+                .demoted_role_models
+                .lock()
+                .map(|set| set.contains(&model_config.model_name))
+                .unwrap_or(false);
+            if already_demoted {
+                demote_developer_role(&mut payload);
+            }
+            let base_payload = Arc::new(payload);
+            let demote_role = Arc::new(AtomicBool::new(already_demoted));
+            let demoted_role_models = Arc::clone(&self.demoted_role_models);
+            let demote_model_name = model_config.model_name.clone();
             let response = self
-                .with_retry(|| async {
-                    let resp = self
-                        .api_client
-                        .request(&self.base_path)
-                        .model_headers(model_config)?
-                        .streaming(self.supports_streaming)
-                        .response_post(&payload)
-                        .await?;
-                    handle_status(resp).await
+                .with_retry(move || {
+                    let base_payload = Arc::clone(&base_payload);
+                    let demote_role = Arc::clone(&demote_role);
+                    let demoted_role_models = Arc::clone(&demoted_role_models);
+                    let demote_model_name = demote_model_name.clone();
+                    async move {
+                        let mut payload = (*base_payload).clone();
+                        if demote_role.load(Ordering::Relaxed) {
+                            demote_developer_role(&mut payload);
+                        }
+                        let resp = self
+                            .api_client
+                            .request(&self.base_path)
+                            .model_headers(model_config)?
+                            .streaming(self.supports_streaming)
+                            .response_post(&payload)
+                            .await?;
+                        handle_status(resp).await.inspect_err(|e| {
+                            if is_role_rejection(e) {
+                                demote_role.store(true, Ordering::Relaxed);
+                                if let Ok(mut set) = demoted_role_models.lock() {
+                                    set.insert(demote_model_name.clone());
+                                }
+                            }
+                        })
+                    }
                 })
                 .await
                 .inspect_err(|e| {
@@ -1034,7 +1135,8 @@ pub fn from_declarative_config(
         .custom_models(custom_models)
         .dynamic_models(config.dynamic_models)
         .skip_canonical_filtering(config.skip_canonical_filtering)
-        .preserve_thinking_context(config.preserves_thinking))
+        .preserve_thinking_context(config.preserves_thinking)
+        .disable_responses_api(config.disable_responses_api))
 }
 
 pub fn parse_custom_headers(s: String) -> HashMap<String, String> {
@@ -1094,6 +1196,8 @@ mod tests {
             preserve_thinking_context: false,
             session_id_provider: None,
             native_openai: false,
+            disable_responses_api: false,
+            demoted_role_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1506,6 +1610,7 @@ mod tests {
             session_id_header_override: None,
             timeout_seconds: None,
             supports_streaming: None,
+            disable_responses_api: false,
             requires_auth: false,
             catalog_provider_id: None,
             base_path: None,
@@ -1647,6 +1752,8 @@ mod tests {
             preserve_thinking_context: false,
             session_id_provider: None,
             native_openai: false,
+            disable_responses_api: false,
+            demoted_role_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2070,5 +2177,131 @@ mod tests {
                 .any(|model| model.name == "gpt-4"),
             "registry-only list should include models the old hardcoded list had drifted past"
         );
+    }
+
+    #[test]
+    fn disable_responses_api_keeps_responses_model_names_on_chat_completions() {
+        let provider = make_provider("test-gateway");
+        assert!(
+            provider.should_use_responses_api_for_provider("gpt-6-luna"),
+            "default routing sends gpt-6-style names to the Responses API"
+        );
+
+        let mut forced = make_provider("test-gateway");
+        forced.disable_responses_api = true;
+        assert!(!forced.should_use_responses_api_for_provider("gpt-6-luna"));
+        assert!(!forced.should_use_responses_api_for_provider("gpt-5.4"));
+        assert!(!forced.should_use_responses_api_for_provider("o3"));
+    }
+
+    #[test]
+    fn declarative_config_propagates_disable_responses_api() {
+        struct AlwaysKey;
+        impl crate::declarative::KeyResolver for AlwaysKey {
+            type Error = std::env::VarError;
+            fn resolve_key(&self, _key: &str) -> std::result::Result<String, Self::Error> {
+                Ok("key".to_string())
+            }
+        }
+        let mut config = custom_config("https://gateway.example/v1");
+        config.disable_responses_api = true;
+        let provider = from_declarative_config(config, None, AlwaysKey)
+            .unwrap()
+            .build();
+        assert!(!provider.should_use_responses_api_for_provider("gpt-6-luna"));
+    }
+
+    #[test]
+    fn role_rejection_detection_matches_known_gateway_errors() {
+        assert!(is_role_rejection(&ProviderError::RequestFailed(
+            "developer is not one of ['system', 'assistant', 'user', 'tool', 'function'].".into(),
+        )));
+        assert!(is_role_rejection(&ProviderError::RequestFailed(
+            "Incorrect role information.".into(),
+        )));
+        assert!(is_role_rejection(&ProviderError::RequestFailed(
+            "role developer is not supported by this model".into(),
+        )));
+        assert!(!is_role_rejection(&ProviderError::RequestFailed(
+            "insufficient quota".into(),
+        )));
+        assert!(!is_role_rejection(&ProviderError::NetworkError(
+            "dropped".into()
+        )));
+    }
+
+    #[test]
+    fn demote_developer_role_rewrites_only_the_system_prompt() {
+        let mut payload = json!({
+            "model": "m",
+            "messages": [
+                {"role": "developer", "content": "system prompt"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"}
+            ]
+        });
+        demote_developer_role(&mut payload);
+        let messages = payload["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], json!("system"));
+        assert_eq!(messages[1]["role"], json!("user"));
+        assert_eq!(messages[2]["role"], json!("assistant"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_retries_with_system_role_when_developer_is_rejected() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("developer"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {"message": "developer is not one of ['system', 'assistant', 'user', 'tool', 'function']."}
+                })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("\"system\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .mount(&server)
+            .await;
+
+        let mut provider = make_provider_with_custom_models(
+            &server.uri(),
+            "v1/chat/completions",
+            vec!["test-model".to_string()],
+        );
+        provider.supports_streaming = false;
+
+        // A reasoning-flagged model makes create_request emit the `developer` role.
+        let mut model = ModelConfig::new("test-model");
+        model.reasoning = Some(true);
+        let stream = provider
+            .stream(&model, "be brief", &[], &[])
+            .await
+            .expect("demotion fallback should recover from the role rejection");
+        let (message, _) = goose_provider_types::base::collect_stream(stream)
+            .await
+            .unwrap();
+        assert_eq!(message.as_concat_text(), "hello");
+
+        // The demotion is remembered: a second request goes straight to `system`.
+        assert!(provider
+            .demoted_role_models
+            .lock()
+            .unwrap()
+            .contains("test-model"));
     }
 }

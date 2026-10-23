@@ -22,6 +22,7 @@ fn custom_config_with_auth(base_url: &str, auth: AuthConfig) -> DeclarativeProvi
         description: None,
         api_key_env: String::new(),
         base_url: base_url.to_string(),
+        disable_responses_api: false,
         models: vec![goose_providers::base::ModelInfo::new("test-model")],
         headers: None,
         session_id_header_override: None,
