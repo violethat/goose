@@ -406,6 +406,7 @@ mod tests {
             session_id_header_override: None,
             timeout_seconds: None,
             supports_streaming: Some(true),
+            disable_responses_api: false,
             requires_auth: true,
             catalog_provider_id: Some("huggingface".to_string()),
             base_path: None,

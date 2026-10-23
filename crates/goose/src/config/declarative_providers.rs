@@ -228,6 +228,7 @@ pub fn create_custom_provider(
         timeout_seconds: None,
         supports_streaming: params.supports_streaming,
         requires_auth: params.requires_auth,
+        disable_responses_api: false,
         catalog_provider_id: params.catalog_provider_id,
         base_path: params.base_path,
         env_vars: None,
@@ -349,6 +350,7 @@ pub fn update_custom_provider(params: UpdateCustomProviderParams) -> Result<()> 
             session_id_header_override: existing_config.session_id_header_override,
             timeout_seconds: existing_config.timeout_seconds,
             supports_streaming: params.supports_streaming,
+            disable_responses_api: false,
             requires_auth: params.requires_auth,
             catalog_provider_id: params.catalog_provider_id,
             base_path: params.base_path,
@@ -609,6 +611,7 @@ mod tests {
             description: None,
             api_key_env: String::new(),
             base_url: "https://router.huggingface.co/v1".to_string(),
+            disable_responses_api: false,
             models: vec![ModelInfo {
                 name: "test/model".to_string(),
                 resolved_model: None,
