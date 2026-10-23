@@ -20,6 +20,7 @@ mod provider_lifecycle;
 mod recipe_scheduling_lifecycle;
 mod reconstruction_isolation_lifecycle;
 mod steering_lifecycle;
+mod stream_retry_lifecycle;
 mod tool_lifecycle;
 
 async fn capture_state_machine_trace_fields(

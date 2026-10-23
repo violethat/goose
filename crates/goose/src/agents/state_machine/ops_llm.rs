@@ -134,6 +134,10 @@ impl Provider for GooseInferenceProvider {
         self.inner.get_name()
     }
 
+    fn manages_own_context(&self) -> bool {
+        self.inner.manages_own_context()
+    }
+
     fn provider_session_id(&self) -> Option<String> {
         self.inner.provider_session_id()
     }
