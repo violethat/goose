@@ -1216,11 +1216,21 @@ fn classify_choiceless_frame(value: &Value) -> Option<ProviderError> {
 /// A choice-less frame that reports an in-stream failure is NOT metadata either — see
 /// `classify_choiceless_frame`.
 fn parse_streaming_chunk(line: &str) -> Result<Option<StreamingChunk>, ProviderError> {
-    let value: Value = serde_json::from_str(line).map_err(|e| {
-        ProviderError::stream_decode_error(format!(
-            "Failed to parse streaming chunk: {e}: {line:?}"
-        ))
-    })?;
+    // Forgiving decoding: cheap/gateway-backed models sometimes emit
+    // corrupted or truncated JSON frames mid-stream. Failing the whole turn
+    // on one bad frame is exactly what kills long autonomous sessions, so a
+    // frame that is syntactically not JSON is dropped with a warning and the
+    // stream continues. Real provider error frames (an "error" key) are still
+    // surfaced below.
+    let value: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(parse_err) => {
+            tracing::warn!(
+                "Skipping malformed streaming chunk (JSON parse failed): {parse_err}: {line:?}"
+            );
+            return Ok(None);
+        }
+    };
 
     if let Some(error) = value.get("error") {
         let message = error
@@ -1248,11 +1258,17 @@ fn parse_streaming_chunk(line: &str) -> Result<Option<StreamingChunk>, ProviderE
         return Ok(None);
     }
 
-    serde_json::from_value(value).map(Some).map_err(|e| {
-        ProviderError::stream_decode_error(format!(
-            "Failed to parse streaming chunk: {e}: {line:?}"
-        ))
-    })
+    // Same forgiveness policy as the syntax check above: if the frame *is*
+    // JSON but doesn't match the expected shape (missing fields, type
+    // mismatches, unusual gateway decorations), drop it instead of failing
+    // the stream. The accumulated conversation state is unaffected.
+    match serde_json::from_value::<StreamingChunk>(value) {
+        Ok(chunk) => Ok(Some(chunk)),
+        Err(e) => {
+            tracing::warn!("Skipping unparseable streaming chunk (shape mismatch): {e}: {line:?}");
+            Ok(None)
+        }
+    }
 }
 
 fn output_token_limit_marker(id: Option<String>) -> Message {

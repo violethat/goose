@@ -11,10 +11,10 @@ use gloo_timers::future::sleep;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::time::sleep;
 
-pub const DEFAULT_MAX_RETRIES: usize = 3;
+pub const DEFAULT_MAX_RETRIES: usize = 8;
 pub const DEFAULT_INITIAL_RETRY_INTERVAL_MS: u64 = 1000;
 pub const DEFAULT_BACKOFF_MULTIPLIER: f64 = 2.0;
-pub const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 30_000;
+pub const DEFAULT_MAX_RETRY_INTERVAL_MS: u64 = 120_000;
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {

@@ -557,6 +557,43 @@ pub trait Provider: MaybeSend + MaybeSync {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<(Message, ProviderUsage), ProviderError> {
+        let config = self.retry_config();
+        let mut attempt: usize = 0;
+
+        loop {
+            match self
+                .attempt_complete(model_config, system, messages, tools)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    // Only retry transient failures (network drops, server
+                    // errors, rate limits). Semantic failures (bad request,
+                    // auth, context overflow) are surfaced immediately.
+                    if crate::retry::should_retry(&error, &config) && attempt < config.max_retries {
+                        attempt += 1;
+                        tracing::warn!(
+                            "Stream failed, retrying ({}/{}): {}",
+                            attempt,
+                            config.max_retries,
+                            error
+                        );
+                        tokio::time::sleep(config.delay_for_attempt(attempt)).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn attempt_complete(
+        &self,
+        model_config: &ModelConfig,
+        system: &str,
+        messages: &[Message],
+        tools: &[Tool],
+    ) -> Result<(Message, ProviderUsage), ProviderError> {
         let stream = self.stream(model_config, system, messages, tools).await?;
         collect_stream(stream).await
     }
