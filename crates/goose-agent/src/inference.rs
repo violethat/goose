@@ -15,6 +15,7 @@ use goose_provider_types::conversation::{
 };
 use goose_provider_types::errors::ProviderError;
 use goose_provider_types::model::ModelConfig;
+use goose_provider_types::retry::{should_retry, RetryConfig};
 use tracing_futures::Instrument;
 
 use crate::machine::MachineSession;
@@ -76,6 +77,11 @@ pub trait InferenceEffect: From<Message> + MaybeSend + 'static {
 pub const EMPTY_RESPONSE_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
 const MAX_EMPTY_RESPONSE_RETRIES: usize = 3;
+/// Times a *transient* provider failure (network blip, dropped stream, 5xx,
+/// 429) may restart the whole inference request. Long agent turns die when a
+/// gateway drops the SSE stream mid-turn; a bounded restart turns that into a
+/// stutter instead of a dead session.
+const MAX_STREAM_INTERRUPT_RETRIES: usize = 3;
 const EMPTY_RESPONSE_NOTE_SCOPE: &str = "inference";
 const EMPTY_RESPONSE_NOTE: &str = "empty_response";
 
@@ -381,6 +387,43 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
         emit.message(message);
     }
 
+    /// Backoff for the next transient-failure restart, or `None` when the
+    /// error is not transient, the retry budget is spent, or the provider
+    /// manages its own context (restarting those is not safe — their internal
+    /// state advances with every request).
+    fn stream_retry_delay(
+        &self,
+        err: &ProviderError,
+        retries_so_far: usize,
+        max_retries: usize,
+        emit: &Emitter,
+    ) -> Option<std::time::Duration> {
+        if retries_so_far >= max_retries
+            || emit.cancel_token().is_cancelled()
+            || self.provider.manages_own_context()
+        {
+            return None;
+        }
+        let config = RetryConfig::default().transient_only();
+        if !should_retry(err, &config) {
+            return None;
+        }
+        Some(config.delay_for_attempt(retries_so_far + 1))
+    }
+
+    /// Sleep out the restart backoff. Returns `false` when cancelled —
+    /// cancellation must win over retrying.
+    async fn wait_out_stream_retry_backoff(
+        &self,
+        delay: std::time::Duration,
+        emit: &Emitter,
+    ) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => true,
+            _ = emit.cancelled() => false,
+        }
+    }
+
     fn error_outcome(
         &self,
         err: &ProviderError,
@@ -486,7 +529,8 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
             let successful_tool_response =
                 ends_with_successful_tool_response(conversation.messages());
             let mut empty_responses = 0;
-            let empty_output = loop {
+            let mut stream_retries = 0;
+            let empty_output = 'attempts: loop {
             let attempt_start = self.output().usage.len();
             let stream = self
                 .provider
@@ -498,10 +542,32 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
                 )
                 .await;
 
-            let mut stream = match stream {
+            let stream = match stream {
                 Ok(stream) => stream,
-                Err(err) => return self.error_outcome(&err, &mut operation_logs, emit),
+                Err(err) => {
+                    if let Some(delay) = self.stream_retry_delay(
+                        &err,
+                        stream_retries,
+                        MAX_STREAM_INTERRUPT_RETRIES,
+                        emit,
+                    ) {
+                        stream_retries += 1;
+                        tracing::warn!(
+                            error = %err,
+                            attempt = stream_retries,
+                            "LLM request failed transiently; retrying"
+                        );
+                        self.output().usage.truncate(attempt_start);
+                        self.output().accumulator.clear();
+                        if !self.wait_out_stream_retry_backoff(delay, emit).await {
+                            return self.error_outcome(&err, &mut operation_logs, emit);
+                        }
+                        continue 'attempts;
+                    }
+                    return self.error_outcome(&err, &mut operation_logs, emit);
+                }
             };
+            let mut stream = stream;
 
             let requested_model = model_config.model_name.clone();
             let resolved_model = self
@@ -522,7 +588,35 @@ impl<S: MachineSession, E: InferenceEffect> Inference<S, E> for InferenceRunner<
             while let Some(result) = stream.next().await {
                 let (msg_opt, usage_opt) = match result {
                     Ok(chunk) => chunk,
-                    Err(err) => return self.error_outcome(&err, &mut operation_logs, emit),
+                    Err(err) => {
+                        if let Some(delay) = self.stream_retry_delay(
+                            &err,
+                            stream_retries,
+                            MAX_STREAM_INTERRUPT_RETRIES,
+                            emit,
+                        ) {
+                            stream_retries += 1;
+                            tracing::warn!(
+                                error = %err,
+                                attempt = stream_retries,
+                                "LLM stream interrupted mid-turn; restarting the request"
+                            );
+                            emit.message(Message::assistant().with_system_notification(
+                                goose_provider_types::conversation::message::SystemNotificationType::InlineMessage,
+                                format!(
+                                    "Connection to the model dropped; retrying (attempt {stream_retries}/{MAX_STREAM_INTERRUPT_RETRIES})"
+                                ),
+                            ));
+                            self.output().usage.truncate(attempt_start);
+                            self.output().accumulator.clear();
+                            tool_request_ids.clear();
+                            if !self.wait_out_stream_retry_backoff(delay, emit).await {
+                                return self.error_outcome(&err, &mut operation_logs, emit);
+                            }
+                            continue 'attempts;
+                        }
+                        return self.error_outcome(&err, &mut operation_logs, emit);
+                    }
                 };
                 if let Some(usage) = usage_opt {
                     record_chat_usage(&tracing::Span::current(), &usage);
