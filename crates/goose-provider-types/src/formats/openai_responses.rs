@@ -427,6 +427,9 @@ pub enum ContentBlockPart {
 }
 
 fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message], supports_vision: bool) {
+    // Old images dominate the request body long before tokens run out;
+    // keep only the most recent ones.
+    let messages = super::image_retention::retain_recent_images(messages);
     for message in messages.iter().filter(|m| m.is_agent_visible()) {
         let role = match message.role {
             Role::User => "user",
@@ -1366,6 +1369,35 @@ mod document_tests {
         assert!(text.contains("q3-report.pdf"), "{text}");
         assert!(text.contains("user messages"), "{text}");
         assert!(!text.contains("cGRmLWJ5dGVz"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod image_retention_format_tests {
+    use super::*;
+    use crate::conversation::message::MessageContentBlock;
+    use rmcp::model::ImageContent;
+
+    #[test]
+    fn responses_payload_keeps_only_the_most_recent_images() {
+        let _guard = env_lock::lock_env([("GOOSE_MAX_RETAINED_IMAGES", Some("1"))]);
+        let messages: Vec<Message> = (0..3)
+            .map(|_| {
+                Message::user().with_content(MessageContentBlock::Image(ImageContent::new(
+                    "aGk=",
+                    "image/png",
+                )))
+            })
+            .chain(std::iter::once(Message::assistant().with_text("done")))
+            .collect();
+
+        let mut input_items = Vec::new();
+        add_message_items(&mut input_items, &messages, true);
+
+        let serialized = serde_json::to_string(&input_items).unwrap();
+        let image_count = serialized.matches("input_image").count();
+        assert_eq!(image_count, 1);
+        assert!(serialized.contains("image omitted from history"));
     }
 }
 

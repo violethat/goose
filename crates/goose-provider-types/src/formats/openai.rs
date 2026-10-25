@@ -244,6 +244,9 @@ pub fn format_messages_with_options(
     image_format: &ImageFormat,
     options: OpenAiFormatOptions,
 ) -> Vec<Value> {
+    // Old images dominate the request body long before tokens run out;
+    // keep only the most recent ones.
+    let messages = super::image_retention::retain_recent_images(messages);
     let mut messages_spec = Vec::new();
     let mut pending_assistant_reasoning = String::new();
     // Reasoning to propagate across consecutive tool-call messages in the same turn.
@@ -251,7 +254,7 @@ pub fn format_messages_with_options(
     let mut tool_call_turn_reasoning = String::new();
     let mut saw_tool_response = false;
 
-    for message in messages {
+    for message in messages.iter() {
         if options.preserve_thinking_context && message.role != Role::Assistant {
             pending_assistant_reasoning.clear();
         }
@@ -1994,6 +1997,39 @@ pub fn is_valid_function_name(name: &str) -> bool {
     static RE: OnceLock<Regex> = OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(r"^[a-zA-Z0-9_-]+$").unwrap());
     re.is_match(name)
+}
+
+#[cfg(test)]
+mod image_retention_format_tests {
+    use super::*;
+    use rmcp::model::ImageContent;
+
+    fn image_message() -> Message {
+        Message::user().with_content(MessageContentBlock::Image(ImageContent::new(
+            "aGk=",
+            "image/png",
+        )))
+    }
+
+    #[test]
+    fn payload_keeps_only_the_most_recent_images() {
+        let _guard = env_lock::lock_env([("GOOSE_MAX_RETAINED_IMAGES", Some("2"))]);
+        let messages: Vec<Message> = (0..4).map(|_| image_message()).collect();
+
+        let spec = format_messages_with_options(
+            &messages,
+            &ImageFormat::OpenAi,
+            OpenAiFormatOptions {
+                supports_vision: true,
+                ..Default::default()
+            },
+        );
+
+        let serialized = serde_json::to_string(&spec).unwrap();
+        let image_count = serialized.matches("\"type\":\"image_url\"").count();
+        assert_eq!(image_count, 2);
+        assert!(serialized.contains("image omitted from history"));
+    }
 }
 
 #[cfg(test)]
