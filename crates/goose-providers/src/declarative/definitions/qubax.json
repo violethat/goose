@@ -1985,7 +1985,7 @@
   "timeout_seconds": 600,
   "preserves_thinking": true,
   "supports_streaming": true,
-  "disable_responses_api": true,
+  "disable_responses_api": false,
   "dynamic_models": false,
   "requires_auth": true,
   "setup": {
