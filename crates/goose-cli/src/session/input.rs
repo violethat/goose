@@ -11,6 +11,31 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use strum::VariantNames;
 
+#[cfg(all(test, unix))]
+#[path = "../../tests/support/terminal_resize.rs"]
+mod resize_tests;
+
+/// The line editor behind the REPL prompt.
+///
+/// Kept separate from `Session` so the terminal-resize test can drive a live
+/// prompt with exactly the configuration a real session gets.
+pub(crate) fn create_editor(
+    edit_mode: Option<rustyline::EditMode>,
+    completion_cache: Arc<std::sync::RwLock<CompletionCache>>,
+) -> Result<Editor<GooseCompleter, rustyline::history::DefaultHistory>> {
+    let builder = rustyline::Config::builder().completion_type(rustyline::CompletionType::Circular);
+    let builder = match edit_mode {
+        Some(mode) => builder.edit_mode(mode),
+        None => builder.edit_mode(rustyline::EditMode::Emacs),
+    };
+    let mut editor =
+        rustyline::Editor::<GooseCompleter, rustyline::history::DefaultHistory>::with_config(
+            builder.build(),
+        )?;
+    editor.set_helper(Some(GooseCompleter::new(completion_cache)));
+    Ok(editor)
+}
+
 #[derive(Debug)]
 pub enum InputResult {
     Message(String),

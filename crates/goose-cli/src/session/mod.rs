@@ -649,20 +649,7 @@ impl CliSession {
     fn create_editor(
         &self,
     ) -> Result<rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>> {
-        let builder =
-            rustyline::Config::builder().completion_type(rustyline::CompletionType::Circular);
-        let builder = match self.edit_mode {
-            Some(mode) => builder.edit_mode(mode),
-            None => builder.edit_mode(EditMode::Emacs),
-        };
-        let config = builder.build();
-        let mut editor =
-            rustyline::Editor::<GooseCompleter, rustyline::history::DefaultHistory>::with_config(
-                config,
-            )?;
-        let completer = GooseCompleter::new(self.completion_cache.clone());
-        editor.set_helper(Some(completer));
-        Ok(editor)
+        input::create_editor(self.edit_mode, self.completion_cache.clone())
     }
 
     async fn handle_input(
