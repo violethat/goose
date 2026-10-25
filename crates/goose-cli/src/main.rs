@@ -37,6 +37,7 @@ async fn run() -> Result<()> {
 fn main() -> Result<()> {
     #[cfg(windows)]
     enable_windows_vt_processing();
+    goose_cli::signal::mask_window_change();
 
     let handle = std::thread::Builder::new()
         .name("goose-cli-main".to_string())

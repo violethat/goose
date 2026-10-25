@@ -158,6 +158,9 @@ fn launch_editor(editor_cmd: &str, file_path: &Path) -> Result<()> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+    // The signal mask survives execve, and the editor owns the terminal from here
+    // on: it has to be told when the window moves.
+    unsafe { crate::signal::forward_window_change_to(&mut cmd) };
 
     let status = cmd.status()?;
 

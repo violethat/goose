@@ -365,6 +365,9 @@ pub(super) fn read_paste_aware_input(
     editor: &mut Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     paste_state: Arc<std::sync::RwLock<PasteState>>,
 ) -> rustyline::Result<String> {
+    // Only this thread may take SIGWINCH, so the line editor is the one whose
+    // read is interrupted when the terminal is resized.
+    let _window_changes = crate::signal::receive_window_change();
     let input = editor.readline("> ")?;
     let expanded = paste_state
         .read()
