@@ -148,6 +148,10 @@ pub struct OpenAiProvider {
     /// built with the `system` role from the first attempt onwards.
     #[serde(skip)]
     demoted_role_models: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Models whose gateway rejected `reasoning_effort` alongside function
+    /// tools on Chat Completions; requests for these drop the field.
+    #[serde(skip)]
+    effort_stripped_models: Arc<Mutex<std::collections::HashSet<String>>>,
     #[serde(skip)]
     session_id_provider: Option<OpenAiSessionIdProvider>,
     #[serde(skip)]
@@ -184,6 +188,7 @@ pub struct OpenAiProviderBuilder {
     native_openai: bool,
     disable_responses_api: bool,
     demoted_role_models: Arc<Mutex<std::collections::HashSet<String>>>,
+    effort_stripped_models: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl OpenAiProviderBuilder {
@@ -204,6 +209,7 @@ impl OpenAiProviderBuilder {
             native_openai: false,
             disable_responses_api: false,
             demoted_role_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            effort_stripped_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -309,6 +315,7 @@ impl OpenAiProviderBuilder {
             native_openai: self.native_openai,
             disable_responses_api: self.disable_responses_api,
             demoted_role_models: self.demoted_role_models,
+            effort_stripped_models: self.effort_stripped_models,
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -443,6 +450,7 @@ impl OpenAiProvider {
             native_openai: false,
             disable_responses_api: false,
             demoted_role_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            effort_stripped_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -706,6 +714,29 @@ fn is_role_rejection(error: &ProviderError) -> bool {
                 || lowered.contains("unrecognized")))
 }
 
+/// Some gateways reject the combination of function tools and
+/// `reasoning_effort` on Chat Completions ("Function tools with
+/// reasoning_effort are not supported for <model> in /v1/chat/completions.
+/// To use function tools, use /v1/responses or set reasoning_effort to
+/// 'none'."). Matching the exact upstream text is fragile, so key on the
+/// field name plus a rejection phrasing.
+fn is_reasoning_effort_rejection(error: &ProviderError) -> bool {
+    let ProviderError::RequestFailed(message) = error else {
+        return false;
+    };
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("reasoning_effort")
+        && (lowered.contains("not supported")
+            || lowered.contains("unsupported")
+            || lowered.contains("invalid"))
+}
+
+fn strip_reasoning_effort(payload: &mut serde_json::Value) {
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("reasoning_effort");
+    }
+}
+
 /// Rewrite the system-prompt message from OpenAI's `developer` role to the
 /// universally supported `system` role.
 fn demote_developer_role(payload: &mut serde_json::Value) {
@@ -961,20 +992,40 @@ impl Provider for OpenAiProvider {
             if already_demoted {
                 demote_developer_role(&mut payload);
             }
+            // The same gateways may also reject `reasoning_effort` combined
+            // with function tools on Chat Completions; the field is dropped
+            // for models that rejected it.
+            let already_stripped_effort = self
+                .effort_stripped_models
+                .lock()
+                .map(|set| set.contains(&model_config.model_name))
+                .unwrap_or(false);
+            if already_stripped_effort {
+                strip_reasoning_effort(&mut payload);
+            }
             let base_payload = Arc::new(payload);
             let demote_role = Arc::new(AtomicBool::new(already_demoted));
+            let strip_effort = Arc::new(AtomicBool::new(already_stripped_effort));
             let demoted_role_models = Arc::clone(&self.demoted_role_models);
+            let effort_stripped_models = Arc::clone(&self.effort_stripped_models);
             let demote_model_name = model_config.model_name.clone();
+            let effort_model_name = model_config.model_name.clone();
             let response = self
                 .with_retry(move || {
                     let base_payload = Arc::clone(&base_payload);
                     let demote_role = Arc::clone(&demote_role);
+                    let strip_effort = Arc::clone(&strip_effort);
                     let demoted_role_models = Arc::clone(&demoted_role_models);
+                    let effort_stripped_models = Arc::clone(&effort_stripped_models);
                     let demote_model_name = demote_model_name.clone();
+                    let effort_model_name = effort_model_name.clone();
                     async move {
                         let mut payload = (*base_payload).clone();
                         if demote_role.load(Ordering::Relaxed) {
                             demote_developer_role(&mut payload);
+                        }
+                        if strip_effort.load(Ordering::Relaxed) {
+                            strip_reasoning_effort(&mut payload);
                         }
                         let resp = self
                             .api_client
@@ -988,6 +1039,12 @@ impl Provider for OpenAiProvider {
                                 demote_role.store(true, Ordering::Relaxed);
                                 if let Ok(mut set) = demoted_role_models.lock() {
                                     set.insert(demote_model_name.clone());
+                                }
+                            }
+                            if is_reasoning_effort_rejection(e) {
+                                strip_effort.store(true, Ordering::Relaxed);
+                                if let Ok(mut set) = effort_stripped_models.lock() {
+                                    set.insert(effort_model_name.clone());
                                 }
                             }
                         })
@@ -1198,6 +1255,7 @@ mod tests {
             native_openai: false,
             disable_responses_api: false,
             demoted_role_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            effort_stripped_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1754,6 +1812,7 @@ mod tests {
             native_openai: false,
             disable_responses_api: false,
             demoted_role_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            effort_stripped_models: Arc::new(Mutex::new(std::collections::HashSet::new())),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2303,5 +2362,89 @@ mod tests {
             .lock()
             .unwrap()
             .contains("test-model"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_retries_without_reasoning_effort_when_rejected_with_tools() {
+        use rmcp::object;
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_string_contains("reasoning_effort"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {"message": "Function tools with reasoning_effort are not supported for test-model in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'."}
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut provider = make_provider_with_custom_models(
+            &server.uri(),
+            "v1/chat/completions",
+            vec!["test-model".to_string()],
+        );
+        provider.supports_streaming = false;
+
+        // A reasoning model with a thinking effort emits `reasoning_effort`,
+        // which the gateway rejects while function tools are attached.
+        let mut model = ModelConfig::new("test-model");
+        model.reasoning = Some(true);
+        let model = model.with_merged_request_params(HashMap::from([(
+            "thinking_effort".to_string(),
+            json!("medium"),
+        )]));
+        let tool = Tool::new(
+            "test_tool",
+            "A test tool",
+            object!({
+                "type": "object",
+                "properties": {
+                    "input": {"type": "string", "description": "Test parameter"}
+                },
+                "required": ["input"]
+            }),
+        );
+        let stream = provider
+            .stream(&model, "be brief", &[], &[tool])
+            .await
+            .expect("fallback should recover from the reasoning_effort rejection");
+        let (message, _) = goose_provider_types::base::collect_stream(stream)
+            .await
+            .unwrap();
+        assert_eq!(message.as_concat_text(), "hello");
+
+        // The strip is remembered: a second request never sends the field.
+        assert!(provider
+            .effort_stripped_models
+            .lock()
+            .unwrap()
+            .contains("test-model"));
+        let stream = provider
+            .stream(&model, "be brief", &[], &[])
+            .await
+            .expect("stripped requests for the model keep working");
+        let (message, _) = goose_provider_types::base::collect_stream(stream)
+            .await
+            .unwrap();
+        assert_eq!(message.as_concat_text(), "hello");
     }
 }
