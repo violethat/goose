@@ -177,22 +177,26 @@ impl ResponseUsage {
 pub enum ResponsesStreamEvent {
     #[serde(rename = "response.created")]
     ResponseCreated {
+        #[serde(default)]
         sequence_number: i32,
         response: ResponseMetadata,
     },
     #[serde(rename = "response.in_progress")]
     ResponseInProgress {
+        #[serde(default)]
         sequence_number: i32,
         response: ResponseMetadata,
     },
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded {
+        #[serde(default)]
         sequence_number: i32,
         output_index: i32,
         item: ResponseOutputItemInfo,
     },
     #[serde(rename = "response.content_part.added")]
     ContentBlockPartAdded {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -201,6 +205,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.output_text.delta")]
     OutputTextDelta {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -213,12 +218,14 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.output_item.done")]
     OutputItemDone {
+        #[serde(default)]
         sequence_number: i32,
         output_index: i32,
         item: ResponseOutputItemInfo,
     },
     #[serde(rename = "response.content_part.done")]
     ContentBlockPartDone {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -227,6 +234,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.output_text.done")]
     OutputTextDone {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -237,18 +245,25 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.completed")]
     ResponseCompleted {
+        #[serde(default)]
         sequence_number: i32,
         response: ResponseMetadata,
     },
     #[serde(rename = "response.incomplete")]
     ResponseIncomplete {
+        #[serde(default)]
         sequence_number: i32,
         response: ResponseMetadata,
     },
     #[serde(rename = "response.failed")]
-    ResponseFailed { sequence_number: i32, error: Value },
+    ResponseFailed {
+        #[serde(default)]
+        sequence_number: i32,
+        error: Value,
+    },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -258,6 +273,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.function_call_arguments.done")]
     FunctionCallArgumentsDone {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -265,6 +281,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.refusal.delta")]
     RefusalDelta {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -273,6 +290,7 @@ pub enum ResponsesStreamEvent {
     },
     #[serde(rename = "response.refusal.done")]
     RefusalDone {
+        #[serde(default)]
         sequence_number: i32,
         item_id: String,
         output_index: i32,
@@ -1359,6 +1377,37 @@ mod tests {
     use futures::StreamExt;
     use rmcp::model::CallToolRequestParams;
     use rmcp::object;
+
+    #[tokio::test]
+    async fn responses_stream_parses_events_without_sequence_number() -> anyhow::Result<()> {
+        // qubax (and other OpenAI-compatible gateways) omit `sequence_number`
+        // from every stream event.
+        let lines = vec![
+            r#"data: {"type":"response.created","response":{"id":"resp_1","object":"response","status":"in_progress","model":"gpt-6.1-sol"}}"#.to_string(),
+            r#"data: {"type":"response.output_text.delta","item_id":"msg_1","output_index":0,"content_index":0,"delta":"ok"}"#.to_string(),
+            r#"data: {"type":"response.completed","response":{"id":"resp_1","object":"response","status":"completed","model":"gpt-6.1-sol","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#.to_string(),
+            "data: [DONE]".to_string(),
+        ];
+
+        let response_stream = tokio_stream::iter(lines.into_iter().map(Ok));
+        let messages = responses_api_to_streaming_message(response_stream);
+        futures::pin_mut!(messages);
+
+        let mut text_parts = Vec::new();
+        while let Some(item) = messages.next().await {
+            let (message, _) = item?;
+            if let Some(msg) = message {
+                for content in msg.content {
+                    if let MessageContentBlock::Text(text) = content {
+                        text_parts.push(text.text.clone());
+                    }
+                }
+            }
+        }
+
+        assert_eq!(text_parts.concat(), "ok");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_responses_stream_ignores_keepalive_event() -> anyhow::Result<()> {
