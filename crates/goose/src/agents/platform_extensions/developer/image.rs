@@ -13,6 +13,22 @@ use super::edit::resolve_path;
 
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Longest edge an image may keep before it is downscaled for sending.
+/// Vision models resample to roughly this size anyway; sending the full
+/// bitmap only inflates the request body.
+fn max_image_edge() -> u32 {
+    std::env::var("GOOSE_READ_IMAGE_MAX_EDGE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1568)
+}
+
+/// Encoded size that triggers downscaling even within the edge limit;
+/// noisy PNGs stay huge at moderate dimensions.
+const DOWNSCALE_BYTES_THRESHOLD: usize = 800 * 1024;
+
+const JPEG_QUALITY: u8 = 85;
+
 fn visible_text(text: impl Into<String>) -> ContentBlock {
     ContentBlock::Text(
         TextContent::new(text).with_annotations(Annotations::default().with_priority(0.0)),
@@ -67,6 +83,7 @@ impl ImageTool {
                     "bytes": loaded.bytes_len,
                     "originalWidth": loaded.original_width,
                     "originalHeight": loaded.original_height,
+                    "resized": loaded.resized,
                     "crop": params.crop,
                 }));
                 result
@@ -92,6 +109,7 @@ struct LoadedImage {
     original_width: u32,
     original_height: u32,
     cropped: bool,
+    resized: bool,
 }
 
 impl LoadedImage {
@@ -104,12 +122,78 @@ impl LoadedImage {
         } else {
             String::new()
         };
+        let resize_note = if self.resized {
+            format!(
+                " Resized from {}x{} to {}x{} to bound request size.",
+                self.original_width, self.original_height, self.width, self.height
+            )
+        } else {
+            String::new()
+        };
 
         format!(
-            "Loaded image from {source} ({} bytes, {}, {}x{}).{crop_note}",
+            "Loaded image from {source} ({} bytes, {}, {}x{}).{crop_note}{resize_note}",
             self.bytes_len, self.mime_type, self.width, self.height
         )
     }
+}
+
+struct EncodedImage {
+    bytes: Vec<u8>,
+    mime_type: &'static str,
+    width: u32,
+    height: u32,
+}
+
+/// Downscales oversized images before they enter the conversation: request
+/// bodies carrying several full-resolution screenshots get rejected by
+/// gateways long before the token budget is spent. Returns `None` when the
+/// image should be passed through unchanged (small enough, animated GIF, or
+/// the re-encode did not actually shrink it).
+fn downscale_if_needed(
+    image: &image::DynamicImage,
+    format: image::ImageFormat,
+    encoded_len: usize,
+) -> Result<Option<EncodedImage>, String> {
+    if format == image::ImageFormat::Gif {
+        return Ok(None);
+    }
+    let (width, height) = image.dimensions();
+    let long_edge = width.max(height);
+    let max_edge = max_image_edge().max(1);
+    if encoded_len <= DOWNSCALE_BYTES_THRESHOLD {
+        return Ok(None);
+    }
+
+    let scale = (max_edge as f64 / long_edge as f64).min(1.0);
+    let target_width = ((width as f64 * scale).round() as u32).max(1);
+    let target_height = ((height as f64 * scale).round() as u32).max(1);
+    let resized = image.thumbnail(target_width, target_height);
+
+    let mut cursor = Cursor::new(Vec::new());
+    let mime_type = if resized.color().has_alpha() {
+        resized
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|error| format!("failed to encode resized image: {error}"))?;
+        "image/png"
+    } else {
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, JPEG_QUALITY);
+        image::DynamicImage::ImageRgb8(resized.to_rgb8())
+            .write_with_encoder(encoder)
+            .map_err(|error| format!("failed to encode resized image: {error}"))?;
+        "image/jpeg"
+    };
+    let bytes = cursor.into_inner();
+    if bytes.len() >= encoded_len {
+        return Ok(None);
+    }
+
+    Ok(Some(EncodedImage {
+        bytes,
+        mime_type,
+        width: target_width,
+        height: target_height,
+    }))
 }
 
 async fn load_image(
@@ -132,6 +216,19 @@ async fn load_image(
     let (original_width, original_height) = image.dimensions();
 
     let Some(crop) = &params.crop else {
+        if let Some(small) = downscale_if_needed(&image, format, bytes.len())? {
+            return Ok(LoadedImage {
+                data: base64::prelude::BASE64_STANDARD.encode(&small.bytes),
+                mime_type: small.mime_type.to_string(),
+                bytes_len: small.bytes.len(),
+                width: small.width,
+                height: small.height,
+                original_width,
+                original_height,
+                cropped: false,
+                resized: true,
+            });
+        }
         return Ok(LoadedImage {
             data: base64::prelude::BASE64_STANDARD.encode(&bytes),
             mime_type: mime_type.to_string(),
@@ -141,6 +238,7 @@ async fn load_image(
             original_width,
             original_height,
             cropped: false,
+            resized: false,
         });
     };
 
@@ -153,15 +251,34 @@ async fn load_image(
     let cropped_bytes = cropped_bytes.into_inner();
     ensure_image_size(cropped_bytes.len() as u64)?;
 
+    let (final_bytes, mime_type, width, height, resized) =
+        match downscale_if_needed(&cropped, image::ImageFormat::Png, cropped_bytes.len())? {
+            Some(small) => (
+                small.bytes,
+                small.mime_type.to_string(),
+                small.width,
+                small.height,
+                true,
+            ),
+            None => (
+                cropped_bytes,
+                "image/png".to_string(),
+                crop.width,
+                crop.height,
+                false,
+            ),
+        };
+
     Ok(LoadedImage {
-        data: base64::prelude::BASE64_STANDARD.encode(&cropped_bytes),
-        mime_type: "image/png".to_string(),
-        bytes_len: cropped_bytes.len(),
-        width: crop.width,
-        height: crop.height,
+        data: base64::prelude::BASE64_STANDARD.encode(&final_bytes),
+        mime_type,
+        bytes_len: final_bytes.len(),
+        width,
+        height,
         original_width,
         original_height,
         cropped: true,
+        resized,
     })
 }
 
@@ -361,6 +478,94 @@ mod local_file_tests {
                 png
             );
         }
+    }
+
+    fn write_noisy_png(path: &std::path::Path, width: u32, height: u32) {
+        let mut image = image::RgbImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            let noise = ((x * 31 + y * 17) % 64) as u8;
+            *pixel = image::Rgb([120 + noise, 60 + noise, 200 - noise]);
+        }
+        image.save(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_opaque_png_is_downscaled_to_jpeg() {
+        let _guard = env_lock::lock_env([("GOOSE_READ_IMAGE_MAX_EDGE", None::<&str>)]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("big.png");
+        write_noisy_png(&path, 1600, 1000);
+
+        let loaded = load_image(
+            &ImageReadParams {
+                source: path.to_string_lossy().into_owned(),
+                crop: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let original_len = std::fs::metadata(&path).unwrap().len() as usize;
+        assert!(loaded.resized);
+        assert_eq!((loaded.width, loaded.height), (1568, 980));
+        assert_eq!(loaded.mime_type, "image/jpeg");
+        assert!(loaded.bytes_len < original_len);
+        assert!(loaded.summary(&path.to_string_lossy()).contains("Resized"));
+    }
+
+    #[tokio::test]
+    async fn oversized_png_with_alpha_stays_png() {
+        let _guard = env_lock::lock_env([("GOOSE_READ_IMAGE_MAX_EDGE", None::<&str>)]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("alpha.png");
+        let mut image = image::RgbaImage::new(2000, 1200);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgba([
+                ((x * 31 + y * 17) % 256) as u8,
+                ((x * 13 + y * 41) % 256) as u8,
+                ((x * 7 + y * 29) % 256) as u8,
+                ((x * 3 + y * 11) % 256) as u8,
+            ]);
+        }
+        image.save(&path).unwrap();
+
+        let loaded = load_image(
+            &ImageReadParams {
+                source: path.to_string_lossy().into_owned(),
+                crop: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let original_len = std::fs::metadata(&path).unwrap().len() as usize;
+        assert!(loaded.resized);
+        assert_eq!((loaded.width, loaded.height), (1568, 941));
+        assert_eq!(loaded.mime_type, "image/png");
+        assert!(loaded.bytes_len < original_len);
+    }
+
+    #[tokio::test]
+    async fn max_edge_env_var_controls_the_downscale() {
+        let _guard = env_lock::lock_env([("GOOSE_READ_IMAGE_MAX_EDGE", Some("64"))]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("medium.png");
+        write_noisy_png(&path, 1000, 1000);
+
+        let loaded = load_image(
+            &ImageReadParams {
+                source: path.to_string_lossy().into_owned(),
+                crop: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(loaded.resized);
+        assert_eq!((loaded.width, loaded.height), (64, 64));
     }
 
     #[tokio::test]
