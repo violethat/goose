@@ -7,6 +7,7 @@ pub mod chatrecall;
 #[cfg(feature = "code-mode")]
 pub mod code_execution;
 pub mod developer;
+pub mod exa;
 pub mod ext_manager;
 #[cfg(feature = "code-mode")]
 mod javascript;
@@ -46,6 +47,20 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 unprefixed_tools: true,
                 hidden: false,
                 client_factory: |ctx| Some(Box::new(analyze::AnalyzeClient::new(ctx).unwrap())),
+            },
+        );
+
+        map.insert(
+            exa::EXTENSION_NAME,
+            PlatformExtensionDef {
+                name: exa::EXTENSION_NAME,
+                display_name: "Exa Search",
+                description:
+                    "High-quality web search, page contents, and similar-page discovery via exa.ai (needs EXA_API_KEY)",
+                default_enabled: false,
+                unprefixed_tools: false,
+                hidden: false,
+                client_factory: |ctx| Some(Box::new(exa::ExaClient::new(ctx).unwrap())),
             },
         );
 
