@@ -2272,9 +2272,12 @@ impl SessionStorage {
                     .and_then(|json| serde_json::from_str::<MessageMetadata>(&json).ok())
                     .unwrap_or_default();
                 metadata.agent_visible = message.metadata.agent_visible;
+                // Compaction can rewrite content (images become placeholders),
+                // so persist it instead of leaving the stored bytes in place.
                 sqlx::query(
-                    "UPDATE messages SET metadata_json = ? WHERE session_id = ? AND message_id = ?",
+                    "UPDATE messages SET content_json = ?, metadata_json = ? WHERE session_id = ? AND message_id = ?",
                 )
+                .bind(serde_json::to_string(&message.content)?)
                 .bind(serde_json::to_string(&metadata)?)
                 .bind(session_id)
                 .bind(message_id)
