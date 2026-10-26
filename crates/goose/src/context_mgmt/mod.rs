@@ -10,11 +10,13 @@ use crate::{config::Config, token_counter::create_token_counter};
 use anyhow::Result;
 use goose_providers::conversation::token_usage::ProviderUsage;
 use goose_providers::errors::ProviderError;
+use goose_providers::formats::image_retention::strip_all_images;
 use goose_providers::model::ModelConfig;
 use indoc::indoc;
 use rmcp::model::Role;
 #[cfg(test)]
 use rmcp::model::{Annotations, ContentBlock, TextContent};
+use std::borrow::Cow;
 use tracing::info;
 use tracing::log::warn;
 
@@ -207,7 +209,13 @@ pub async fn compact_messages(
         }
     }
 
-    let conversation = Conversation::new_unvalidated(final_messages);
+    // The summary describes the history, so the raw image bytes have no
+    // remaining use: drop them so the stored session and replaced-history
+    // events no longer carry them.
+    let conversation = match strip_all_images(&final_messages) {
+        Cow::Owned(messages) => Conversation::new_unvalidated(messages),
+        Cow::Borrowed(_) => Conversation::new_unvalidated(final_messages),
+    };
     let retained_context_tokens = match count_context_tokens(conversation.messages()).await {
         Ok(tokens) => tokens,
         Err(error) => {
@@ -694,6 +702,66 @@ mod tests {
         assert!(
             compaction.usage.usage.output_tokens.is_some(),
             "billable output tokens must survive the rewrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_removes_every_image_from_the_conversation() {
+        let provider = MockProvider::new(Message::assistant().with_text("<mock summary>"), 100_000);
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::user().with_content(MessageContent::Image(rmcp::model::ImageContent::new(
+                "aGk=",
+                "image/png",
+            ))),
+            Message::assistant()
+                .with_tool_request("tool_0", Ok(CallToolRequestParams::new("read_image"))),
+            Message::user().with_tool_response(
+                "tool_0",
+                Ok(rmcp::model::CallToolResult::success(vec![
+                    ContentBlock::text("Loaded image from /tmp/shot.png"),
+                    ContentBlock::Image(rmcp::model::ImageContent::new("aGk=", "image/png")),
+                ])),
+            ),
+            Message::user().with_text("summarize this"),
+        ]);
+
+        let compacted = compact_messages(
+            &provider,
+            &provider.config.clone(),
+            "test-session-id",
+            &conversation,
+            true,
+        )
+        .await
+        .unwrap()
+        .conversation;
+
+        let images = compacted
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|content| {
+                matches!(content, MessageContent::Image(_))
+                    || matches!(
+                        content,
+                        MessageContent::ToolResponse(response)
+                            if matches!(&response.tool_result, Ok(result) if result
+                                .content
+                                .iter()
+                                .any(|c| matches!(c, ContentBlock::Image(_))))
+                    )
+            })
+            .count();
+        assert_eq!(images, 0);
+        let flattened = compacted
+            .messages()
+            .iter()
+            .map(Message::as_concat_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            flattened.contains("image removed during compaction"),
+            "expected compaction placeholders, got: {flattened}"
         );
     }
 

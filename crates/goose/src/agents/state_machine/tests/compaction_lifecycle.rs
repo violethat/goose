@@ -8,7 +8,7 @@ use super::pipeline::{self, test_pipeline, MessageKind::Agent};
 use crate::agents::state_machine;
 use crate::agents::state_machine::ops_compaction::MAX_CONTEXT_ERROR_COMPACTIONS;
 use crate::context_mgmt::{compute_tool_call_cutoff, TOOLCALL_SUMMARIZATION_BATCH_SIZE};
-use crate::conversation::message::{Message, MessageErrorKind};
+use crate::conversation::message::{Message, MessageContent, MessageErrorKind};
 use crate::conversation::Conversation;
 
 const SUMMARIZE_HISTORY: &str = "Please summarize the conversation history";
@@ -138,6 +138,80 @@ async fn proactive_and_manual_compaction_continue_with_replaced_usage() -> Resul
             .and_then(|usage| usage.total_tokens),
         Some(15)
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn compaction_strips_images_from_conversation_and_storage() -> Result<()> {
+    let (pipeline, api) = test_pipeline().await?;
+    api.on(SUMMARIZE_HISTORY).reply("summary");
+
+    pipeline
+        .seed([
+            Message::user()
+                .with_text("look at this screenshot")
+                .with_content(MessageContent::Image(rmcp::model::ImageContent::new(
+                    "aGk=",
+                    "image/png",
+                ))),
+            Message::assistant()
+                .with_tool_request("tool_0", Ok(CallToolRequestParams::new("read_image"))),
+            Message::user().with_tool_response(
+                "tool_0",
+                Ok(CallToolResult::success(vec![
+                    ContentBlock::text("Loaded image from /tmp/shot.png"),
+                    ContentBlock::Image(rmcp::model::ImageContent::new("aGk=", "image/png")),
+                ])),
+            ),
+        ])
+        .await?;
+
+    let compacted = pipeline.run(["/compact"]).await?;
+    compacted.assert_emitted("Compaction complete");
+    assert_eq!(compacted.history_replacements(), 1);
+
+    // Reloaded from storage: the persisted history must carry no image bytes.
+    let stored = pipeline.session().await?;
+    let conversation = stored.conversation.as_ref().unwrap();
+    let image_blocks = |conversation: &Conversation| {
+        conversation
+            .messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|content| {
+                matches!(content, MessageContent::Image(_))
+                    || matches!(
+                        content,
+                        MessageContent::ToolResponse(response)
+                            if matches!(&response.tool_result, Ok(result) if result
+                                .content
+                                .iter()
+                                .any(|c| matches!(c, ContentBlock::Image(_))))
+                    )
+            })
+            .count()
+    };
+    assert_eq!(image_blocks(conversation), 0);
+    assert_eq!(image_blocks(compacted.conversation()), 0);
+    assert!(conversation
+        .messages()
+        .iter()
+        .map(Message::as_concat_text)
+        .any(|text| text.contains("image removed during compaction")));
+    let agent_visible = conversation.agent_visible_messages();
+    assert_eq!(
+        agent_visible
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|content| matches!(content, MessageContent::Image(_)))
+            .count(),
+        0
+    );
+    assert!(agent_visible
+        .iter()
+        .map(Message::as_concat_text)
+        .any(|text| text.contains("summary")));
 
     Ok(())
 }
