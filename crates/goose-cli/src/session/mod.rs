@@ -6,6 +6,7 @@ mod input;
 mod output;
 mod paste;
 mod program_status;
+mod queued_input;
 pub mod streaming_buffer;
 mod task_execution_display;
 mod thinking;
@@ -252,6 +253,9 @@ pub struct CliSession {
     /// gate.
     extension_loading: Option<AbortOnDropHandle<Result<Vec<ExtensionFailure>>>>,
     loading_announced: bool,
+    /// Lines the user typed while an agent turn was running; delivered as
+    /// the next user message when the turn finishes.
+    queued_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +340,7 @@ impl CliSession {
             stats,
             extension_loading,
             loading_announced: false,
+            queued_lines: Vec::new(),
         }
     }
 
@@ -775,22 +780,48 @@ impl CliSession {
         editor: &mut rustyline::Editor<GooseCompleter, rustyline::history::DefaultHistory>,
     ) -> Result<()> {
         history.save(editor);
-        self.push_message(Message::user().with_text(content));
+        let mut next_message = Some(content.to_string());
+        while let Some(content) = next_message.take() {
+            self.push_message(Message::user().with_text(&content));
 
-        let _provider = self.agent.provider(&self.session_id).await?;
+            let _provider = self.agent.provider(&self.session_id).await?;
 
-        println!();
-        output::run_status_hook("thinking");
-        output::show_thinking();
-        let start_time = Instant::now();
-        self.process_agent_response(true, CancellationToken::default())
-            .await?;
-        output::hide_thinking();
+            println!();
+            output::run_status_hook("thinking");
+            output::show_thinking();
+            let start_time = Instant::now();
+            self.process_agent_response(true, CancellationToken::default())
+                .await?;
+            output::hide_thinking();
 
-        let elapsed = start_time.elapsed();
-        let elapsed_str = format_elapsed_time(elapsed);
-        println!("{}", console::style(format!("  ⏱ {}", elapsed_str)).dim());
+            let elapsed = start_time.elapsed();
+            let elapsed_str = format_elapsed_time(elapsed);
+            println!("{}", console::style(format!("  ⏱ {}", elapsed_str)).dim());
+
+            next_message = self.take_queued_message();
+        }
         Ok(())
+    }
+
+    /// Turn queued lines (typed while the agent was working) into the next
+    /// user message, annotated so the model knows how it arrived.
+    fn take_queued_message(&mut self) -> Option<String> {
+        if self.queued_lines.is_empty() {
+            return None;
+        }
+        let lines = std::mem::take(&mut self.queued_lines);
+        println!(
+            "{}",
+            console::style(format!(
+                "  \u{00bb} delivering {} queued message(s) you typed during the last turn",
+                lines.len()
+            ))
+            .dim()
+        );
+        Some(format!(
+            "[The following was typed by the user while you were working and queued for delivery]\n{}",
+            lines.join("\n")
+        ))
     }
 
     fn handle_toggle_theme(&self) {
@@ -1319,6 +1350,10 @@ impl CliSession {
         });
         let _drop_handle = AbortOnDropHandle::new(handle);
 
+        // While this turn runs, keep accepting user input: typed lines are
+        // queued and delivered as the next message once the turn finishes.
+        let mut queued_collector = queued_input::start(interactive, cancel_token.clone());
+
         program_status::report(ProgramStatus::Working, None);
         let mut stream = self
             .agent
@@ -1355,6 +1390,9 @@ impl CliSession {
                                         ProgramStatus::Blocked(BlockedKind::Permission),
                                         Some(&confirmation_request.tool_name),
                                     );
+                                    let _pause = queued_collector
+                                        .as_ref()
+                                        .map(|collector| collector.pause_guard());
                                     let permission = prompt_tool_confirmation(&confirmation_request)?;
                                     program_status::report(ProgramStatus::Working, None);
                                     permission
@@ -1434,6 +1472,9 @@ impl CliSession {
                                     ProgramStatus::Blocked(BlockedKind::Question),
                                     Some(&elicitation_message),
                                 );
+                                let _pause = queued_collector
+                                    .as_ref()
+                                    .map(|collector| collector.pause_guard());
                                 match elicitation::collect_elicitation_input(&elicitation_message, &schema, &cancel_token_clone) {
                                     Ok(input) => {
                                         program_status::report(ProgramStatus::Working, None);
@@ -1544,6 +1585,31 @@ impl CliSession {
                     }
                     break;
                 }
+            }
+        }
+
+        if let Some(collector) = queued_collector.take() {
+            let (lines, partial, interrupted) = collector.stop();
+            if interrupted {
+                if !lines.is_empty() {
+                    println!(
+                        "{}",
+                        console::style(format!(
+                            "  \u{00bb} dropped {} queued message(s) after interrupt",
+                            lines.len()
+                        ))
+                        .dim()
+                    );
+                }
+            } else {
+                self.queued_lines.extend(lines);
+            }
+            if !partial.is_empty() {
+                println!(
+                    "{}",
+                    console::style(format!("  \u{00bb} discarded unfinished input: {partial}"))
+                        .dim()
+                );
             }
         }
 
