@@ -256,6 +256,7 @@ pub struct CliSession {
     /// Lines the user typed while an agent turn was running; delivered as
     /// the next user message when the turn finishes.
     queued_lines: Vec<String>,
+    queued_input_hint_shown: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +342,7 @@ impl CliSession {
             extension_loading,
             loading_announced: false,
             queued_lines: Vec::new(),
+            queued_input_hint_shown: false,
         }
     }
 
@@ -804,7 +806,7 @@ impl CliSession {
     }
 
     /// Turn queued lines (typed while the agent was working) into the next
-    /// user message, annotated so the model knows how it arrived.
+    /// user message. Each text already carries its own "queued" note.
     fn take_queued_message(&mut self) -> Option<String> {
         if self.queued_lines.is_empty() {
             return None;
@@ -818,10 +820,7 @@ impl CliSession {
             ))
             .dim()
         );
-        Some(format!(
-            "[The following was typed by the user while you were working and queued for delivery]\n{}",
-            lines.join("\n")
-        ))
+        Some(lines.join("\n\n"))
     }
 
     fn handle_toggle_theme(&self) {
@@ -1353,6 +1352,14 @@ impl CliSession {
         // While this turn runs, keep accepting user input: typed lines are
         // queued and delivered as the next message once the turn finishes.
         let mut queued_collector = queued_input::start(interactive, cancel_token.clone());
+        if queued_collector.is_some() && !self.queued_input_hint_shown {
+            self.queued_input_hint_shown = true;
+            println!(
+                "{}",
+                console::style("  \u{00b7} while I work you can keep typing to queue a message \u{2014} Enter queues it")
+                    .dim()
+            );
+        }
 
         program_status::report(ProgramStatus::Working, None);
         let mut stream = self
@@ -1577,6 +1584,18 @@ impl CliSession {
                         None => break,
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_millis(250)), if queued_collector.is_some() => {
+                    let Some(collector) = queued_collector.as_ref() else {
+                        continue;
+                    };
+                    for line in collector.take_lines() {
+                        let noted =
+                            format!("[queued from the user while you were working] {line}");
+                        self.agent
+                            .steer(&self.session_id, Message::user().with_text(&noted))
+                            .await;
+                    }
+                }
                 _ = cancel_token_clone.cancelled() => {
                     drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
                     drop(stream);
@@ -1590,19 +1609,11 @@ impl CliSession {
 
         if let Some(collector) = queued_collector.take() {
             let (lines, partial, interrupted) = collector.stop();
-            if interrupted {
-                if !lines.is_empty() {
-                    println!(
-                        "{}",
-                        console::style(format!(
-                            "  \u{00bb} dropped {} queued message(s) after interrupt",
-                            lines.len()
-                        ))
-                        .dim()
-                    );
-                }
-            } else {
-                self.queued_lines.extend(lines);
+            for line in &lines {
+                let noted = format!("[queued from the user while you were working] {line}");
+                self.agent
+                    .steer(&self.session_id, Message::user().with_text(&noted))
+                    .await;
             }
             if !partial.is_empty() {
                 println!(
@@ -1610,6 +1621,23 @@ impl CliSession {
                     console::style(format!("  \u{00bb} discarded unfinished input: {partial}"))
                         .dim()
                 );
+            }
+            let pending = self.agent.take_pending_steers(&self.session_id).await;
+            if interrupted {
+                if !pending.is_empty() {
+                    println!(
+                        "{}",
+                        console::style(format!(
+                            "  \u{00bb} dropped {} queued message(s) after interrupt",
+                            pending.len()
+                        ))
+                        .dim()
+                    );
+                }
+            } else {
+                for message in pending {
+                    self.queued_lines.push(message.as_concat_text());
+                }
             }
         }
 

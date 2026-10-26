@@ -364,6 +364,16 @@ impl Agent {
         self.steer_queues.lock().await.remove(session_id);
     }
 
+    /// Take back steer messages that a finished turn never consumed, so the
+    /// caller can deliver them itself (for example as a follow-up turn).
+    pub async fn take_pending_steers(&self, session_id: &str) -> Vec<Message> {
+        let Some(queue) = self.steer_queues.lock().await.remove(session_id) else {
+            return Vec::new();
+        };
+        let mut guard = queue.lock().await;
+        guard.drain(..).collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn tracks_confirmations_for(&self, session_id: &str) -> bool {
         self.tool_confirmation_coordinator.tracks(session_id)
