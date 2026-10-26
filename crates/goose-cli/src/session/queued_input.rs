@@ -176,6 +176,12 @@ impl Drop for PauseGuard {
 }
 
 impl Collector {
+    /// Lines completed since the last drain; consumed by the turn loop so it
+    /// can steer them into the running turn between tool calls.
+    pub fn take_lines(&self) -> Vec<String> {
+        std::mem::take(&mut *self.shared.lines.lock().unwrap())
+    }
+
     /// Suspend collecting and hand the terminal back to the main thread.
     pub fn pause_guard(&self) -> PauseGuard {
         self.shared.paused.store(true, Ordering::Relaxed);
@@ -259,7 +265,17 @@ fn raw_termios() -> libc::termios {
     unsafe {
         libc::tcgetattr(libc::STDIN_FILENO, termios.as_mut_ptr());
         let mut raw = termios.assume_init();
-        libc::cfmakeraw(&mut raw);
+        // Input-only raw mode: the collector needs unechoed, unbuffered,
+        // signal-free reads, but output processing (OPOST) must stay on —
+        // the main thread prints plain "\n" and relies on the terminal
+        // driver to translate it to CRLF. cfmakeraw would break the
+        // alignment of every line the session prints.
+        raw.c_iflag &=
+            !(libc::ICRNL | libc::IXON | libc::INLCR | libc::IGNCR | libc::ISTRIP | libc::BRKINT);
+        raw.c_lflag &=
+            !(libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ICANON | libc::ISIG | libc::IEXTEN);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
         raw
     }
 }
@@ -362,7 +378,7 @@ fn handle_byte(shared: &Shared, byte: u8, cancel_token: &CancellationToken) {
     match action {
         InputAction::None => {}
         InputAction::StartLine => {
-            let _ = stdout.write_all("\r\n  \u{00bb} ".as_bytes());
+            let _ = stdout.write_all("\n  \u{00bb} ".as_bytes());
             let _ = stdout.write_all(&[byte]);
         }
         InputAction::EchoByte => {
@@ -379,7 +395,7 @@ fn handle_byte(shared: &Shared, byte: u8, cancel_token: &CancellationToken) {
                     lines.push(line.clone());
                 }
             }
-            let note = format!("\r\n  \u{2713} queued: {line}\r\n");
+            let note = format!("\n  \u{2713} queued: {line}\n");
             let _ = stdout.write_all(console::style(note).dim().to_string().as_bytes());
         }
         InputAction::ClearLine => {
