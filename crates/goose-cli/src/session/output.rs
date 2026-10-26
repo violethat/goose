@@ -162,24 +162,29 @@ pub fn get_show_full_tool_output() -> bool {
 #[derive(Default)]
 pub struct ThinkingIndicator {
     spinner: Option<cliclack::ProgressBar>,
+    base_message: String,
+    user_input: Option<String>,
 }
 
 impl ThinkingIndicator {
     pub fn show(&mut self) {
         let spinner = cliclack::spinner();
         let hint = style("(Ctrl+C to interrupt)").dim();
-        if Config::global()
+        let base_message = if Config::global()
             .get_param("RANDOM_THINKING_MESSAGES")
             .unwrap_or(true)
         {
-            spinner.start(format!(
+            format!(
                 "{}...  {}",
                 super::thinking::get_random_thinking_message(),
                 hint,
-            ));
+            )
         } else {
-            spinner.start(format!("Thinking...  {}", hint));
-        }
+            format!("Thinking...  {}", hint)
+        };
+        spinner.start(&base_message);
+        self.base_message = base_message;
+        self.user_input = None;
         self.spinner = Some(spinner);
     }
 
@@ -187,10 +192,29 @@ impl ThinkingIndicator {
         if let Some(spinner) = self.spinner.take() {
             spinner.stop("");
         }
+        self.user_input = None;
     }
 
     pub fn is_shown(&self) -> bool {
         self.spinner.is_some()
+    }
+
+    /// Show the live queued-input indicator alongside the thinking message,
+    /// so typing during inference stays visible without fighting the
+    /// spinner for the cursor.
+    pub fn set_user_input(&mut self, input: Option<String>) {
+        if self.user_input == input {
+            return;
+        }
+        self.user_input = input;
+        let Some(spinner) = &self.spinner else {
+            return;
+        };
+        let message = match &self.user_input {
+            Some(input) => format!("{}  {}", self.base_message, input),
+            None => self.base_message.clone(),
+        };
+        spinner.set_message(message);
     }
 }
 
@@ -216,6 +240,16 @@ pub fn show_thinking() {
 pub fn hide_thinking() {
     if std::io::stdout().is_terminal() {
         THINKING.with(|t| t.borrow_mut().hide());
+    }
+}
+
+pub fn thinking_is_shown() -> bool {
+    THINKING.with(|t| t.borrow().is_shown())
+}
+
+pub fn set_thinking_user_input(input: Option<String>) {
+    if std::io::stdout().is_terminal() {
+        THINKING.with(|t| t.borrow_mut().set_user_input(input));
     }
 }
 
@@ -1647,6 +1681,10 @@ pub struct McpSpinners {
     bars: HashMap<String, ProgressBar>,
     log_spinner: Option<ProgressBar>,
     shell_output_lines: VecDeque<String>,
+    /// Live queued-input indicator ("\u{00bb} typing...", "\u{2713} queued: ..."),
+    /// appended to the log spinner's message so it repaints together with
+    /// the shell output instead of fighting it for the cursor.
+    user_input: Option<String>,
     multi_bar: MultiProgress,
 }
 
@@ -1656,11 +1694,16 @@ impl McpSpinners {
             bars: HashMap::new(),
             log_spinner: None,
             shell_output_lines: VecDeque::new(),
+            user_input: None,
             multi_bar: MultiProgress::new(),
         }
     }
 
     pub fn log(&mut self, message: &str) {
+        let message = match &self.user_input {
+            Some(input) => format!("{message}\n  {input}"),
+            None => message.to_string(),
+        };
         let spinner = self.log_spinner.get_or_insert_with(|| {
             let bar = self.multi_bar.add(
                 ProgressBar::new_spinner()
@@ -1669,13 +1712,13 @@ impl McpSpinners {
                             .unwrap()
                             .tick_chars("⠋⠙⠚⠛⠓⠒⠊⠉"),
                     )
-                    .with_message(message.to_string()),
+                    .with_message(message.clone()),
             );
             bar.enable_steady_tick(Duration::from_millis(100));
             bar
         });
 
-        spinner.set_message(message.to_string());
+        spinner.set_message(message);
     }
 
     pub fn log_shell_output(&mut self, lines: Vec<String>, max_lines: usize) {
@@ -1683,6 +1726,24 @@ impl McpSpinners {
         if !message.is_empty() {
             self.log(&message);
         }
+    }
+
+    /// Update the live queued-input indicator. Only shown once the log
+    /// spinner exists (i.e. the turn is streaming shell output); during
+    /// plain inference the thinking indicator carries it instead.
+    pub fn set_user_input(&mut self, input: Option<String>) {
+        if self.log_spinner.is_none() || self.user_input == input {
+            self.user_input = input;
+            return;
+        }
+        self.user_input = input;
+        let message = self
+            .shell_output_lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        self.log(&message);
     }
 
     pub fn update(&mut self, token: &str, value: f64, total: Option<f64>, message: Option<&str>) {
@@ -1712,6 +1773,7 @@ impl McpSpinners {
             spinner.disable_steady_tick();
         }
         self.shell_output_lines.clear();
+        self.user_input = None;
         self.multi_bar.clear()
     }
 }

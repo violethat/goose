@@ -12,7 +12,6 @@
 //! are dropped when the turn is interrupted.
 
 use goose::config::Config;
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -137,11 +136,18 @@ impl LineInput {
         self.partial.clear();
         self.line_started = false;
     }
+
+    fn partial_text(&self) -> String {
+        String::from_utf8_lossy(&self.partial).to_string()
+    }
 }
 
 struct Shared {
     state: Mutex<LineInput>,
     lines: Mutex<Vec<String>>,
+    /// What the main thread should render as the live input indicator:
+    /// the line being typed, or a short-lived note like "✓ queued: ...".
+    display: Mutex<Option<String>>,
     paused: AtomicBool,
     stop: AtomicBool,
 }
@@ -180,6 +186,12 @@ impl Collector {
     /// can steer them into the running turn between tool calls.
     pub fn take_lines(&self) -> Vec<String> {
         std::mem::take(&mut *self.shared.lines.lock().unwrap())
+    }
+
+    /// Current input indicator for the main thread to render: the partial
+    /// line while typing, a note right after submitting, or None.
+    pub fn display(&self) -> Option<String> {
+        self.shared.display.lock().ok().and_then(|d| d.clone())
     }
 
     /// Suspend collecting and hand the terminal back to the main thread.
@@ -242,6 +254,7 @@ pub fn start(interactive: bool, cancel_token: CancellationToken) -> Option<Colle
         let shared = Arc::new(Shared {
             state: Mutex::new(LineInput::default()),
             lines: Mutex::new(Vec::new()),
+            display: Mutex::new(None),
             paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
@@ -364,28 +377,23 @@ fn run(shared: Arc<Shared>, cancel_token: CancellationToken) {
         for byte in &buffer[..read as usize] {
             handle_byte(&shared, *byte, &cancel_token);
         }
-        let _ = std::io::stdout().flush();
     }
 }
 
 #[cfg(unix)]
 fn handle_byte(shared: &Shared, byte: u8, cancel_token: &CancellationToken) {
+    // Never write to stdout from this thread: the turn's spinners own the
+    // cursor and repaint on their own schedule, so raw interleaved writes
+    // corrupt their line accounting. Display state is read by the main
+    // thread and rendered through the spinner machinery instead.
     let Ok(mut state) = shared.state.lock() else {
         return;
     };
     let action = state.feed(byte);
-    let mut stdout = std::io::stdout();
     match action {
         InputAction::None => {}
-        InputAction::StartLine => {
-            let _ = stdout.write_all("\n  \u{00bb} ".as_bytes());
-            let _ = stdout.write_all(&[byte]);
-        }
-        InputAction::EchoByte => {
-            let _ = stdout.write_all(&[byte]);
-        }
-        InputAction::Backspace => {
-            let _ = stdout.write_all("\u{8} \u{8}".as_bytes());
+        InputAction::StartLine | InputAction::EchoByte | InputAction::Backspace => {
+            set_display(shared, &format!("\u{00bb} {}", state.partial_text()));
         }
         InputAction::SubmitLine => {
             let line = state.take_line();
@@ -394,19 +402,26 @@ fn handle_byte(shared: &Shared, byte: u8, cancel_token: &CancellationToken) {
                 if let Ok(mut lines) = shared.lines.lock() {
                     lines.push(line.clone());
                 }
+                set_display(shared, &format!("\u{2713} queued: {line}"));
             }
-            let note = format!("\n  \u{2713} queued: {line}\n");
-            let _ = stdout.write_all(console::style(note).dim().to_string().as_bytes());
         }
         InputAction::ClearLine => {
             state.clear();
-            let _ = stdout.write_all(
-                "\r\n  \u{00bb} (line cleared, keep typing or Ctrl-C to interrupt)\r\n".as_bytes(),
+            set_display(
+                shared,
+                "(line cleared — keep typing, or Ctrl-C on an empty line to interrupt)",
             );
         }
         InputAction::Interrupt => {
             cancel_token.cancel();
         }
+    }
+}
+
+#[cfg(unix)]
+fn set_display(shared: &Shared, text: &str) {
+    if let Ok(mut display) = shared.display.lock() {
+        *display = Some(text.to_string());
     }
 }
 
