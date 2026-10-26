@@ -1584,7 +1584,7 @@ impl CliSession {
                         None => break,
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(250)), if queued_collector.is_some() => {
+                _ = tokio::time::sleep(Duration::from_millis(80)), if queued_collector.is_some() => {
                     let Some(collector) = queued_collector.as_ref() else {
                         continue;
                     };
@@ -1594,6 +1594,18 @@ impl CliSession {
                         self.agent
                             .steer(&self.session_id, Message::user().with_text(&noted))
                             .await;
+                    }
+                    // Render the typed-input indicator through whichever
+                    // spinner owns the screen right now; the collector
+                    // itself never writes to the terminal.
+                    let display = collector.display();
+                    if output::thinking_is_shown() {
+                        output::set_thinking_user_input(display);
+                    } else if display.is_some() {
+                        progress_bars.set_user_input(display);
+                    } else {
+                        progress_bars.set_user_input(None);
+                        output::set_thinking_user_input(None);
                     }
                 }
                 _ = cancel_token_clone.cancelled() => {
