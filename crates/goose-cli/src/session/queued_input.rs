@@ -147,10 +147,24 @@ struct Shared {
     lines: Mutex<Vec<String>>,
     /// What the main thread should render as the live input indicator:
     /// the line being typed, or a short-lived note like "✓ queued: ...".
-    display: Mutex<Option<String>>,
+    display: Mutex<Option<DisplayState>>,
     paused: AtomicBool,
     stop: AtomicBool,
 }
+
+/// Live indicator for the main thread to render. A `Note` is an
+/// acknowledgment ("✓ queued: ..."): it must outlive the moment its lines
+/// are drained — drain and render share one tick, so clearing on drain
+/// would erase it before it is ever painted — but it must also expire on
+/// its own, or it clings to every spinner for the rest of the turn. The
+/// `Typing` indicator stays for as long as the line is half-typed.
+enum DisplayState {
+    Typing(String),
+    Note(String, std::time::Instant),
+}
+
+/// How long an acknowledgment note stays on the screen before fading.
+const NOTE_TTL: Duration = Duration::from_millis(2000);
 
 /// Handle returned by [`start`] when a collector is running.
 pub struct Collector {
@@ -189,9 +203,23 @@ impl Collector {
     }
 
     /// Current input indicator for the main thread to render: the partial
-    /// line while typing, a note right after submitting, or None.
+    /// line while typing, or an acknowledgment note that expires on its own.
     pub fn display(&self) -> Option<String> {
-        self.shared.display.lock().ok().and_then(|d| d.clone())
+        let Ok(mut display) = self.shared.display.lock() else {
+            return None;
+        };
+        match *display {
+            Some(DisplayState::Typing(ref text)) => Some(text.clone()),
+            Some(DisplayState::Note(ref text, ref until)) => {
+                if *until > std::time::Instant::now() {
+                    Some(text.clone())
+                } else {
+                    *display = None;
+                    None
+                }
+            }
+            None => None,
+        }
     }
 
     /// Suspend collecting and hand the terminal back to the main thread.
@@ -393,7 +421,7 @@ fn handle_byte(shared: &Shared, byte: u8, cancel_token: &CancellationToken) {
     match action {
         InputAction::None => {}
         InputAction::StartLine | InputAction::EchoByte | InputAction::Backspace => {
-            set_display(shared, &format!("\u{00bb} {}", state.partial_text()));
+            set_typing(shared, &format!("\u{00bb} {}", state.partial_text()));
         }
         InputAction::SubmitLine => {
             let line = state.take_line();
@@ -402,12 +430,12 @@ fn handle_byte(shared: &Shared, byte: u8, cancel_token: &CancellationToken) {
                 if let Ok(mut lines) = shared.lines.lock() {
                     lines.push(line.clone());
                 }
-                set_display(shared, &format!("\u{2713} queued: {line}"));
+                set_note(shared, &format!("\u{2713} queued: {line}"));
             }
         }
         InputAction::ClearLine => {
             state.clear();
-            set_display(
+            set_note(
                 shared,
                 "(line cleared — keep typing, or Ctrl-C on an empty line to interrupt)",
             );
@@ -419,9 +447,19 @@ fn handle_byte(shared: &Shared, byte: u8, cancel_token: &CancellationToken) {
 }
 
 #[cfg(unix)]
-fn set_display(shared: &Shared, text: &str) {
+fn set_typing(shared: &Shared, text: &str) {
     if let Ok(mut display) = shared.display.lock() {
-        *display = Some(text.to_string());
+        *display = Some(DisplayState::Typing(text.to_string()));
+    }
+}
+
+#[cfg(unix)]
+fn set_note(shared: &Shared, text: &str) {
+    if let Ok(mut display) = shared.display.lock() {
+        *display = Some(DisplayState::Note(
+            text.to_string(),
+            std::time::Instant::now() + NOTE_TTL,
+        ));
     }
 }
 
@@ -511,5 +549,70 @@ mod tests {
         }
         let _ = input.feed(b'\r');
         assert_eq!(input.take_line(), "héllo");
+    }
+
+    #[cfg(unix)]
+    fn shared_with(bytes: &[u8]) -> Shared {
+        let shared = Shared {
+            state: Mutex::new(LineInput::default()),
+            lines: Mutex::new(Vec::new()),
+            display: Mutex::new(None),
+            paused: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        for byte in bytes {
+            handle_byte(&shared, *byte, &token);
+        }
+        shared
+    }
+
+    fn collector_for(shared: Shared) -> Collector {
+        Collector {
+            shared: Arc::new(shared),
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            handle: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queued_note_survives_the_drain_and_expires_on_its_own() {
+        let shared = shared_with(b"keep going\r");
+        let collector = collector_for(shared);
+        assert_eq!(
+            collector.display().as_deref(),
+            Some("\u{2713} queued: keep going")
+        );
+        // Drain and render share one tick with the drain first, so the note
+        // must still be visible after its lines are taken.
+        assert_eq!(collector.take_lines(), vec!["keep going".to_string()]);
+        assert_eq!(
+            collector.display().as_deref(),
+            Some("\u{2713} queued: keep going")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_notes_stop_rendering() {
+        let shared = shared_with(b"");
+        *shared.display.lock().unwrap() = Some(DisplayState::Note(
+            "\u{2713} queued: stale".to_string(),
+            std::time::Instant::now() - Duration::from_millis(1),
+        ));
+        let collector = collector_for(shared);
+        assert_eq!(collector.display(), None);
+        // The expired note was consumed, not resurrected.
+        assert_eq!(collector.display(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn draining_the_queue_keeps_the_typing_indicator() {
+        let shared = shared_with(b"one\rtwo");
+        let collector = collector_for(shared);
+        assert_eq!(collector.take_lines(), vec!["one".to_string()]);
+        assert_eq!(collector.display().as_deref(), Some("\u{00bb} two"));
     }
 }

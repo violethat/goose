@@ -2,6 +2,44 @@ use std::future::Future;
 use std::pin::Pin;
 use tokio::signal;
 
+/// Fatal-signal terminal restore.
+///
+/// goose paints dim-styled status lines and spinners. A process that dies
+/// mid-paint leaves the terminal's SGR state set, so the shell's own report
+/// of the death ("Aborted", "Segmentation fault"...) and every prompt after
+/// it render dim and easy to miss. The handler resets the style, restores
+/// the default disposition, and re-raises so the process still dies with
+/// its real signal (and the shell prints the message in normal color).
+#[cfg(unix)]
+unsafe extern "C" fn reset_terminal_then_default(sig: libc::c_int) {
+    const RESET: &[u8] = b"\x1b[0m\r\n";
+    libc::write(libc::STDERR_FILENO, RESET.as_ptr().cast(), RESET.len());
+    libc::signal(sig, libc::SIG_DFL);
+    libc::raise(sig);
+}
+
+/// Install [`reset_terminal_then_default`] for signals that are otherwise
+/// terminal and unowned: runtime-managed signals (SIGINT, SIGTERM) are left
+/// to their tokio handlers.
+#[cfg(unix)]
+pub fn restore_terminal_on_fatal_signals() {
+    for sig in [
+        libc::SIGABRT,
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGFPE,
+        libc::SIGHUP,
+    ] {
+        let handler = reset_terminal_then_default as unsafe extern "C" fn(libc::c_int);
+        unsafe {
+            libc::signal(sig, handler as libc::sighandler_t);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn restore_terminal_on_fatal_signals() {}
+
 #[cfg(unix)]
 pub fn shutdown_signal() -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(async move {

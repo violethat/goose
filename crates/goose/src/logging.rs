@@ -62,6 +62,11 @@ pub fn build_logging_subscriber(
     let file_appender =
         tracing_appender::rolling::RollingFileAppender::new(Rotation::NEVER, log_dir, log_filename);
 
+    // Log events are rare (a handful per tool call), so a flush per event is
+    // cheap and buys crash forensics: a hard-killed process still leaves a
+    // complete log tail instead of losing the buffered last lines.
+    let file_appender = FlushingAppender::new(file_appender);
+
     let env_filter = build_env_filter(config.extra_directives);
 
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = if config.json {
@@ -104,6 +109,47 @@ pub fn build_logging_subscriber(
     }
 
     Ok(Registry::default().with(layers))
+}
+
+/// [`tracing_appender`]'s file appender buffers internally, so a killed or
+/// aborting process loses its last log lines — exactly the lines that show
+/// what it was doing when it died. Wrapping it to flush after every event
+/// keeps the tail intact for crash forensics.
+struct FlushingAppender {
+    inner: std::sync::Mutex<tracing_appender::rolling::RollingFileAppender>,
+}
+
+impl FlushingAppender {
+    fn new(inner: tracing_appender::rolling::RollingFileAppender) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(inner),
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FlushingAppender {
+    type Writer = EventWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        EventWriter { inner: &self.inner }
+    }
+}
+
+struct EventWriter<'a> {
+    inner: &'a std::sync::Mutex<tracing_appender::rolling::RollingFileAppender>,
+}
+
+impl std::io::Write for EventWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut appender = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let written = appender.write(buf)?;
+        appender.flush()?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).flush()
+    }
 }
 
 /// Returns the directory where log files should be stored for a specific component.

@@ -38,6 +38,7 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     enable_windows_vt_processing();
     goose_cli::signal::mask_window_change();
+    goose_cli::signal::restore_terminal_on_fatal_signals();
 
     let handle = std::thread::Builder::new()
         .name("goose-cli-main".to_string())
