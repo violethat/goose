@@ -13,7 +13,7 @@ use goose::providers::canonical_cost::estimate_model_cost;
 use goose::subprocess::SubprocessExt;
 use goose::utils::safe_truncate;
 use goose_providers::conversation::token_usage::Usage;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rmcp::model::{CallToolRequestParams, JsonObject, PromptArgument, Role};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -1677,14 +1677,21 @@ pub fn display_cost_usage(provider: &str, model: &str, usage: &Usage) {
     }
 }
 
+/// Cap on spinner-block redraws per second. Notification storms (streaming
+/// shell output) redraw the whole multi-progress block; unbounded redraws
+/// read as flicker on terminals without synchronized updates.
+const SPINNER_MAX_HZ: u8 = 10;
+
 pub struct McpSpinners {
     bars: HashMap<String, ProgressBar>,
     log_spinner: Option<ProgressBar>,
     shell_output_lines: VecDeque<String>,
     /// Live queued-input indicator ("\u{00bb} typing...", "\u{2713} queued: ..."),
-    /// appended to the log spinner's message so it repaints together with
-    /// the shell output instead of fighting it for the cursor.
+    /// shown on its own bar so it survives the log spinner's create/clear
+    /// churn. Riding the log spinner's message made it repaint (and vanish
+    /// on every `hide()`) at MCP-notification rate, which read as flicker.
     user_input: Option<String>,
+    input_bar: Option<ProgressBar>,
     multi_bar: MultiProgress,
 }
 
@@ -1695,15 +1702,14 @@ impl McpSpinners {
             log_spinner: None,
             shell_output_lines: VecDeque::new(),
             user_input: None,
-            multi_bar: MultiProgress::new(),
+            input_bar: None,
+            multi_bar: MultiProgress::with_draw_target(ProgressDrawTarget::stderr_with_hz(
+                SPINNER_MAX_HZ,
+            )),
         }
     }
 
     pub fn log(&mut self, message: &str) {
-        let message = match &self.user_input {
-            Some(input) => format!("{message}\n  {input}"),
-            None => message.to_string(),
-        };
         let spinner = self.log_spinner.get_or_insert_with(|| {
             let bar = self.multi_bar.add(
                 ProgressBar::new_spinner()
@@ -1712,13 +1718,13 @@ impl McpSpinners {
                             .unwrap()
                             .tick_chars("⠋⠙⠚⠛⠓⠒⠊⠉"),
                     )
-                    .with_message(message.clone()),
+                    .with_message(message.to_string()),
             );
             bar.enable_steady_tick(Duration::from_millis(100));
             bar
         });
 
-        spinner.set_message(message);
+        spinner.set_message(message.to_string());
     }
 
     pub fn log_shell_output(&mut self, lines: Vec<String>, max_lines: usize) {
@@ -1728,22 +1734,32 @@ impl McpSpinners {
         }
     }
 
-    /// Update the live queued-input indicator. Only shown once the log
-    /// spinner exists (i.e. the turn is streaming shell output); during
-    /// plain inference the thinking indicator carries it instead.
+    /// Update the live queued-input indicator on its own bar, independent of
+    /// the log spinner: created on first use, removed when cleared, never
+    /// tied to MCP notification or message-render churn.
     pub fn set_user_input(&mut self, input: Option<String>) {
-        if self.log_spinner.is_none() || self.user_input == input {
-            self.user_input = input;
+        if self.user_input == input {
             return;
         }
         self.user_input = input;
-        let message = self
-            .shell_output_lines
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n  ");
-        self.log(&message);
+        match (&self.user_input, &mut self.input_bar) {
+            (Some(text), Some(bar)) => {
+                bar.set_message(text.clone());
+            }
+            (Some(text), None) => {
+                let bar = self.multi_bar.add(
+                    ProgressBar::new_spinner()
+                        .with_style(ProgressStyle::with_template("  {msg:.dim}").unwrap()),
+                );
+                bar.set_message(text.clone());
+                self.input_bar = Some(bar);
+            }
+            (None, Some(bar)) => {
+                bar.finish_and_clear();
+                self.input_bar = None;
+            }
+            (None, None) => {}
+        }
     }
 
     pub fn update(&mut self, token: &str, value: f64, total: Option<f64>, message: Option<&str>) {
@@ -1773,7 +1789,13 @@ impl McpSpinners {
             spinner.disable_steady_tick();
         }
         self.shell_output_lines.clear();
+        // Reset so the next set_user_input re-shows the bar: hide() clears
+        // the whole multi-progress draw, so the indicator must be re-drawn
+        // after the message that triggered this hide has printed.
         self.user_input = None;
+        if let Some(bar) = self.input_bar.take() {
+            bar.finish_and_clear();
+        }
         self.multi_bar.clear()
     }
 }

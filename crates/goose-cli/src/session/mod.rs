@@ -1340,7 +1340,8 @@ impl CliSession {
         let user_message = self
             .messages
             .last()
-            .ok_or_else(|| anyhow::anyhow!("No user message"))?;
+            .ok_or_else(|| anyhow::anyhow!("No user message"))?
+            .clone();
         let cancel_token_interrupt = cancel_token.clone();
         let handle = tokio::spawn(async move {
             if ctrl_c().await.is_ok() {
@@ -1351,6 +1352,9 @@ impl CliSession {
 
         // While this turn runs, keep accepting user input: typed lines are
         // queued and delivered as the next message once the turn finishes.
+        // One collector spans the whole call — including any follow-up
+        // replies delivering queued lines — so typing never pauses between
+        // them.
         let mut queued_collector = queued_input::start(interactive, cancel_token.clone());
         if queued_collector.is_some() && !self.queued_input_hint_shown {
             self.queued_input_hint_shown = true;
@@ -1361,281 +1365,304 @@ impl CliSession {
             );
         }
 
-        program_status::report(ProgramStatus::Working, None);
-        let mut stream = self
-            .agent
-            .reply(
-                user_message.clone(),
-                session_config.clone(),
-                Some(cancel_token.clone()),
-            )
-            .await?;
-
-        let mut progress_bars = output::McpSpinners::new();
         let cancel_token_clone = cancel_token.clone();
-        let mut markdown_buffer = streaming_buffer::MarkdownBuffer::new();
-        let mut prompted_credits_urls: HashSet<String> = HashSet::new();
-        let mut thinking_header_shown = false;
         let run_started = Instant::now();
         let mut first_token_at: Option<Instant> = None;
         let mut last_usage: Option<ProviderUsage> = None;
+        let mut prompted_credits_urls: HashSet<String> = HashSet::new();
         let mut stream_error = None;
         let mut input_failed = false;
 
-        use futures::StreamExt;
-        loop {
-            tokio::select! {
-                result = stream.next() => {
-                    match result {
-                        Some(Ok(AgentEvent::Message(message))) => {
-                            if first_token_at.is_none() && message_has_text(&message) {
-                                first_token_at = Some(Instant::now());
-                            }
-                            if let Some(confirmation_request) = find_tool_confirmation(&message) {
-                                let selected_permission = if interactive {
+        // Reply borrows the Arc it is called on for the lifetime of the
+        // returned stream; call it on a local clone so `self` stays free
+        // for the queued-delivery bookkeeping below.
+        let agent = Arc::clone(&self.agent);
+
+        // Queued lines that the finished reply never steered in are delivered
+        // here as immediate follow-up replies — regardless of which entry
+        // point started this turn. Without this loop they could sit through
+        // an extra user turn before anyone picked them up.
+        let mut reply_message = user_message;
+        'replies: loop {
+            program_status::report(ProgramStatus::Working, None);
+            let mut stream = agent
+                .reply(
+                    reply_message.clone(),
+                    session_config.clone(),
+                    Some(cancel_token.clone()),
+                )
+                .await?;
+
+            let mut progress_bars = output::McpSpinners::new();
+            let mut markdown_buffer = streaming_buffer::MarkdownBuffer::new();
+            let mut thinking_header_shown = false;
+
+            use futures::StreamExt;
+            loop {
+                tokio::select! {
+                    result = stream.next() => {
+                        match result {
+                            Some(Ok(AgentEvent::Message(message))) => {
+                                if first_token_at.is_none() && message_has_text(&message) {
+                                    first_token_at = Some(Instant::now());
+                                }
+                                if let Some(confirmation_request) = find_tool_confirmation(&message) {
+                                    let selected_permission = if interactive {
+                                        program_status::report(
+                                            ProgramStatus::Blocked(BlockedKind::Permission),
+                                            Some(&confirmation_request.tool_name),
+                                        );
+                                        let _pause = queued_collector
+                                            .as_ref()
+                                            .map(|collector| collector.pause_guard());
+                                        let permission = prompt_tool_confirmation(&confirmation_request)?;
+                                        program_status::report(ProgramStatus::Working, None);
+                                        permission
+                                    } else {
+                                        // Non-interactive/headless mode: refuse to run in
+                                        // Approve/SmartApprove modes since auto-allowing would
+                                        // bypass the safety contract those modes are meant to enforce.
+                                        let config = Config::global();
+                                        let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
+                                        if goose_mode == GooseMode::Approve || goose_mode == GooseMode::SmartApprove {
+                                            cancel_token_clone.cancel();
+                                            drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
+                                            return Err(anyhow::anyhow!(
+                                                "Tool approval required in non-interactive mode with GooseMode::{goose_mode}. \
+                                                 This is an invalid configuration — Approve/SmartApprove modes require an \
+                                                 interactive terminal. Use GooseMode::Auto for headless sessions."
+                                            ));
+                                        }
+                                        tracing::warn!(
+                                            "Tool confirmation required in non-interactive mode, auto-allowing"
+                                        );
+                                        Permission::AllowOnce
+                                    };
+
+                                    let cancelled_by_user = selected_permission == Permission::Cancel;
+                                    if cancelled_by_user {
+                                        output::render_text("Tool call cancelled. Returning to chat...", Some(Color::Yellow), true);
+                                    }
+                                    self.agent
+                                        .submit_tool_confirmation(
+                                            &self.session_id,
+                                            &confirmation_request.id,
+                                            selected_permission,
+                                        )
+                                        .await?;
+                                    if cancelled_by_user {
+                                        cancel_token_clone.cancel();
+                                        drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
+                                        if !has_tool_response(&self.messages, &confirmation_request.id) {
+                                            let mut response_message = Message::user();
+                                            response_message.content.push(MessageContent::tool_response(
+                                                confirmation_request.id,
+                                                Err(ErrorData {
+                                                    code: ErrorCode::INVALID_REQUEST,
+                                                    message: std::borrow::Cow::from(
+                                                        "Tool call cancelled by user",
+                                                    ),
+                                                    data: None,
+                                                }),
+                                            ));
+                                            self.agent
+                                                .config
+                                                .session_manager
+                                                .add_message(&self.session_id, &response_message)
+                                                .await?;
+                                            self.messages.push(response_message);
+                                        }
+                                        break;
+                                    }
+                                } else if let Some((elicitation_id, elicitation_message, schema)) = find_elicitation_request(&message) {
+                                    if !interactive {
+                                        // Non-interactive/headless mode: cannot collect user input
+                                        tracing::warn!(
+                                            "Elicitation requested in non-interactive mode, cancelling"
+                                        );
+                                        cancel_token_clone.cancel();
+                                        drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
+                                        return Err(anyhow::anyhow!(
+                                            "Elicitation requested but no interactive terminal is available to collect user input"
+                                        ));
+                                    }
+
+                                    output::hide_thinking();
+                                    let _ = progress_bars.hide();
+
                                     program_status::report(
-                                        ProgramStatus::Blocked(BlockedKind::Permission),
-                                        Some(&confirmation_request.tool_name),
+                                        ProgramStatus::Blocked(BlockedKind::Question),
+                                        Some(&elicitation_message),
                                     );
                                     let _pause = queued_collector
                                         .as_ref()
                                         .map(|collector| collector.pause_guard());
-                                    let permission = prompt_tool_confirmation(&confirmation_request)?;
-                                    program_status::report(ProgramStatus::Working, None);
-                                    permission
-                                } else {
-                                    // Non-interactive/headless mode: refuse to run in
-                                    // Approve/SmartApprove modes since auto-allowing would
-                                    // bypass the safety contract those modes are meant to enforce.
-                                    let config = Config::global();
-                                    let goose_mode = config.get_goose_mode().unwrap_or(GooseMode::Auto);
-                                    if goose_mode == GooseMode::Approve || goose_mode == GooseMode::SmartApprove {
-                                        cancel_token_clone.cancel();
-                                        drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
-                                        return Err(anyhow::anyhow!(
-                                            "Tool approval required in non-interactive mode with GooseMode::{goose_mode}. \
-                                             This is an invalid configuration — Approve/SmartApprove modes require an \
-                                             interactive terminal. Use GooseMode::Auto for headless sessions."
-                                        ));
-                                    }
-                                    tracing::warn!(
-                                        "Tool confirmation required in non-interactive mode, auto-allowing"
+                                    // The elicitation sub-reply below shares this
+                                    // session's steer queue; park anything pending
+                                    // so it cannot be drained into that throwaway
+                                    // empty stream.
+                                    let parked_steers =
+                                        self.agent.take_pending_steers(&self.session_id).await;
+                                    let elicitation_outcome = elicitation::collect_elicitation_input(
+                                        &elicitation_message,
+                                        &schema,
+                                        &cancel_token_clone,
                                     );
-                                    Permission::AllowOnce
-                                };
-
-                                let cancelled_by_user = selected_permission == Permission::Cancel;
-                                if cancelled_by_user {
-                                    output::render_text("Tool call cancelled. Returning to chat...", Some(Color::Yellow), true);
-                                }
-                                self.agent
-                                    .submit_tool_confirmation(
-                                        &self.session_id,
-                                        &confirmation_request.id,
-                                        selected_permission,
-                                    )
-                                    .await?;
-                                if cancelled_by_user {
-                                    cancel_token_clone.cancel();
-                                    drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
-                                    if !has_tool_response(&self.messages, &confirmation_request.id) {
-                                        let mut response_message = Message::user();
-                                        response_message.content.push(MessageContent::tool_response(
-                                            confirmation_request.id,
-                                            Err(ErrorData {
-                                                code: ErrorCode::INVALID_REQUEST,
-                                                message: std::borrow::Cow::from(
-                                                    "Tool call cancelled by user",
-                                                ),
-                                                data: None,
-                                            }),
-                                        ));
-                                        self.agent
-                                            .config
-                                            .session_manager
-                                            .add_message(&self.session_id, &response_message)
-                                            .await?;
-                                        self.messages.push(response_message);
+                                    for message in parked_steers {
+                                        self.agent.steer(&self.session_id, message).await;
                                     }
-                                    break;
-                                }
-                            } else if let Some((elicitation_id, elicitation_message, schema)) = find_elicitation_request(&message) {
-                                if !interactive {
-                                    // Non-interactive/headless mode: cannot collect user input
-                                    tracing::warn!(
-                                        "Elicitation requested in non-interactive mode, cancelling"
-                                    );
-                                    cancel_token_clone.cancel();
-                                    drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
-                                    return Err(anyhow::anyhow!(
-                                        "Elicitation requested but no interactive terminal is available to collect user input"
-                                    ));
-                                }
-
-                                output::hide_thinking();
-                                let _ = progress_bars.hide();
-
-                                program_status::report(
-                                    ProgramStatus::Blocked(BlockedKind::Question),
-                                    Some(&elicitation_message),
-                                );
-                                let _pause = queued_collector
-                                    .as_ref()
-                                    .map(|collector| collector.pause_guard());
-                                match elicitation::collect_elicitation_input(&elicitation_message, &schema, &cancel_token_clone) {
-                                    Ok(input) => {
-                                        program_status::report(ProgramStatus::Working, None);
-                                        match &input.action {
-                                            ElicitationAction::Decline => {
-                                                output::render_text("Information request declined.", Some(Color::Yellow), true);
+                                    match elicitation_outcome {
+                                        Ok(input) => {
+                                            program_status::report(ProgramStatus::Working, None);
+                                            match &input.action {
+                                                ElicitationAction::Decline => {
+                                                    output::render_text("Information request declined.", Some(Color::Yellow), true);
+                                                }
+                                                ElicitationAction::Cancel => {
+                                                    output::render_text("Information request cancelled.", Some(Color::Yellow), true);
+                                                }
+                                                ElicitationAction::Accept => {}
+                                                _ => {}
                                             }
-                                            ElicitationAction::Cancel => {
-                                                output::render_text("Information request cancelled.", Some(Color::Yellow), true);
+
+                                            let should_cancel = input.action == ElicitationAction::Cancel;
+                                            let action = input.action;
+                                            let user_data_value = serde_json::to_value(input.user_data)
+                                                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                                            let response_message = Message::user()
+                                                .with_content(MessageContent::action_required_elicitation_response(
+                                                    elicitation_id,
+                                                    user_data_value,
+                                                    action,
+                                                ))
+                                                .with_visibility(false, true);
+                                            self.messages.push(response_message.clone());
+                                            // Elicitation responses return an empty stream - the response
+                                            // unblocks the waiting tool call via ActionRequiredManager
+                                            let _ = self.agent.reply(response_message, session_config.clone(), Some(cancel_token.clone())).await?;
+                                            if should_cancel {
+                                                cancel_token_clone.cancel();
+                                                drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
+                                                break;
                                             }
-                                            ElicitationAction::Accept => {}
-                                            _ => {}
                                         }
-
-                                        let should_cancel = input.action == ElicitationAction::Cancel;
-                                        let action = input.action;
-                                        let user_data_value = serde_json::to_value(input.user_data)
-                                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                                        let response_message = Message::user()
-                                            .with_content(MessageContent::action_required_elicitation_response(
-                                                elicitation_id,
-                                                user_data_value,
-                                                action,
-                                            ))
-                                            .with_visibility(false, true);
-                                        self.messages.push(response_message.clone());
-                                        // Elicitation responses return an empty stream - the response
-                                        // unblocks the waiting tool call via ActionRequiredManager
-                                        let _ = self.agent.reply(response_message, session_config.clone(), Some(cancel_token.clone())).await?;
-                                        if should_cancel {
+                                        Err(e) => {
+                                            output::render_error(&format!("Failed to collect input: {}", e));
+                                            input_failed = true;
                                             cancel_token_clone.cancel();
                                             drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
                                             break;
                                         }
                                     }
-                                    Err(e) => {
-                                        output::render_error(&format!("Failed to collect input: {}", e));
-                                        input_failed = true;
-                                        cancel_token_clone.cancel();
-                                        drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
-                                        break;
+                                } else {
+                                    log_tool_metrics(&message, &self.messages);
+                                    self.messages.push(message.clone());
+
+                                    if interactive { output::hide_thinking() };
+                                    let _ = progress_bars.hide();
+
+                                    if is_stream_json_mode {
+                                        emit_stream_event(&StreamEvent::Message { message: message.clone() });
+                                    } else if !is_json_mode {
+                                        output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
+                                        maybe_open_credits_top_up_url(
+                                            &message,
+                                            interactive,
+                                            &mut prompted_credits_urls,
+                                        );
                                     }
                                 }
-                            } else {
-                                log_tool_metrics(&message, &self.messages);
-                                self.messages.push(message.clone());
-
-                                if interactive { output::hide_thinking() };
-                                let _ = progress_bars.hide();
-
-                                if is_stream_json_mode {
-                                    emit_stream_event(&StreamEvent::Message { message: message.clone() });
-                                } else if !is_json_mode {
-                                    output::render_message_streaming(&message, &mut markdown_buffer, &mut thinking_header_shown, self.debug);
-                                    maybe_open_credits_top_up_url(
-                                        &message,
-                                        interactive,
-                                        &mut prompted_credits_urls,
-                                    );
-                                }
                             }
-                        }
-                        Some(Ok(AgentEvent::Usage(usage))) => {
-                            last_usage = Some(usage);
-                        }
-                        Some(Ok(AgentEvent::MessageUsage { .. })) => {}
-                        Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
-                            handle_mcp_notification(
-                                &extension_id,
-                                &notification,
-                                &mut progress_bars,
-                                is_stream_json_mode,
-                                interactive,
-                                is_json_mode,
-                                self.debug,
-                            );
-                        }
-                        Some(Ok(AgentEvent::HistoryReplaced(updated_conversation))) => {
-                            self.messages = updated_conversation;
-                        }
-                        Some(Err(e)) => {
-                            if interactive || !is_stream_json_mode {
-                                handle_agent_error(&e, is_stream_json_mode);
+                            Some(Ok(AgentEvent::Usage(usage))) => {
+                                last_usage = Some(usage);
                             }
-                            cancel_token_clone.cancel();
-                            drop(stream);
-                            if let Err(e) = self.handle_interrupted_messages(false).await {
-                                eprintln!("Error handling interruption: {}", e);
-                            } else if !is_stream_json_mode {
-                                output::render_error(
-                                    "The error above was an exception we were not able to handle.\n\
-                                    These errors are often related to connection or authentication\n\
-                                    We've removed the conversation up to the most recent user message\n\
-                                    - depending on the error you may be able to continue",
+                            Some(Ok(AgentEvent::MessageUsage { .. })) => {}
+                            Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
+                                handle_mcp_notification(
+                                    &extension_id,
+                                    &notification,
+                                    &mut progress_bars,
+                                    is_stream_json_mode,
+                                    interactive,
+                                    is_json_mode,
+                                    self.debug,
                                 );
                             }
-                            stream_error = Some(e);
-                            break;
+                            Some(Ok(AgentEvent::HistoryReplaced(updated_conversation))) => {
+                                self.messages = updated_conversation;
+                            }
+                            Some(Err(e)) => {
+                                if interactive || !is_stream_json_mode {
+                                    handle_agent_error(&e, is_stream_json_mode);
+                                }
+                                cancel_token_clone.cancel();
+                                drop(stream);
+                                if let Err(e) = self.handle_interrupted_messages(false).await {
+                                    eprintln!("Error handling interruption: {}", e);
+                                } else if !is_stream_json_mode {
+                                    output::render_error(
+                                        "The error above was an exception we were not able to handle.\n\
+                                        These errors are often related to connection or authentication\n\
+                                        We've removed the conversation up to the most recent user message\n\
+                                        - depending on the error you may be able to continue",
+                                    );
+                                }
+                                stream_error = Some(e);
+                                break;
+                            }
+                            None => break,
                         }
-                        None => break,
                     }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(80)), if queued_collector.is_some() => {
-                    let Some(collector) = queued_collector.as_ref() else {
-                        continue;
-                    };
-                    for line in collector.take_lines() {
-                        let noted =
-                            format!("[queued from the user while you were working] {line}");
-                        self.agent
-                            .steer(&self.session_id, Message::user().with_text(&noted))
-                            .await;
+                    _ = tokio::time::sleep(Duration::from_millis(80)), if queued_collector.is_some() => {
+                        let Some(collector) = queued_collector.as_ref() else {
+                            continue;
+                        };
+                        for line in collector.take_lines() {
+                            let noted =
+                                format!("[queued from the user while you were working] {line}");
+                            self.agent
+                                .steer(&self.session_id, Message::user().with_text(&noted))
+                                .await;
+                        }
+                        // Render the typed-input indicator through whichever
+                        // spinner owns the screen right now; the collector
+                        // itself never writes to the terminal.
+                        let display = collector.display();
+                        if output::thinking_is_shown() {
+                            output::set_thinking_user_input(display);
+                            progress_bars.set_user_input(None);
+                        } else {
+                            output::set_thinking_user_input(None);
+                            progress_bars.set_user_input(display);
+                        }
                     }
-                    // Render the typed-input indicator through whichever
-                    // spinner owns the screen right now; the collector
-                    // itself never writes to the terminal.
-                    let display = collector.display();
-                    if output::thinking_is_shown() {
-                        output::set_thinking_user_input(display);
-                    } else if display.is_some() {
-                        progress_bars.set_user_input(display);
-                    } else {
-                        progress_bars.set_user_input(None);
-                        output::set_thinking_user_input(None);
+                    _ = cancel_token_clone.cancelled() => {
+                        drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
+                        drop(stream);
+                        if let Err(e) = self.handle_interrupted_messages(true).await {
+                            eprintln!("Error handling interruption: {}", e);
+                        }
+                        break;
                     }
-                }
-                _ = cancel_token_clone.cancelled() => {
-                    drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
-                    drop(stream);
-                    if let Err(e) = self.handle_interrupted_messages(true).await {
-                        eprintln!("Error handling interruption: {}", e);
-                    }
-                    break;
                 }
             }
-        }
 
-        if let Some(collector) = queued_collector.take() {
-            let (lines, partial, interrupted) = collector.stop();
-            for line in &lines {
-                let noted = format!("[queued from the user while you were working] {line}");
-                self.agent
-                    .steer(&self.session_id, Message::user().with_text(&noted))
-                    .await;
+            // This reply is done: flush its pending markdown, then decide
+            // whether queued lines start another reply.
+            if !is_json_mode && !is_stream_json_mode {
+                output::flush_markdown_buffer_current_theme(&mut markdown_buffer);
             }
-            if !partial.is_empty() {
-                println!(
-                    "{}",
-                    console::style(format!("  \u{00bb} discarded unfinished input: {partial}"))
-                        .dim()
-                );
-            }
+
+            let reply_failed = input_failed
+                || stream_error.is_some()
+                || self
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.error_kind().is_some());
+            // Steers this reply never consumed (typed during its final
+            // inference) come back for the next round.
             let pending = self.agent.take_pending_steers(&self.session_id).await;
-            if interrupted {
+            if reply_failed || cancel_token_clone.is_cancelled() {
                 if !pending.is_empty() {
                     println!(
                         "{}",
@@ -1646,8 +1673,56 @@ impl CliSession {
                         .dim()
                     );
                 }
+                break 'replies;
+            }
+            for message in pending {
+                self.queued_lines.push(message.as_concat_text());
+            }
+            let Some(content) = self.take_queued_message() else {
+                break 'replies;
+            };
+            reply_message = Message::user().with_text(&content);
+            self.push_message(reply_message.clone());
+            if interactive {
+                println!();
+                output::run_status_hook("thinking");
+                output::show_thinking();
+            }
+        }
+
+        // The turn and any follow-up replies are over: stop collecting and
+        // deal with whatever arrived in the final instants. Straggler lines
+        // that were too late for a follow-up reply are kept for the next
+        // turn rather than dropped.
+        if let Some(collector) = queued_collector.take() {
+            let (lines, partial, interrupted) = collector.stop();
+            if !partial.is_empty() {
+                println!(
+                    "{}",
+                    console::style(format!("  \u{00bb} discarded unfinished input: {partial}"))
+                        .dim()
+                );
+            }
+            if interrupted {
+                if !lines.is_empty() {
+                    println!(
+                        "{}",
+                        console::style(format!(
+                            "  \u{00bb} dropped {} queued message(s) after interrupt",
+                            lines.len()
+                        ))
+                        .dim()
+                    );
+                }
+                self.agent.discard_pending_steers(&self.session_id).await;
             } else {
-                for message in pending {
+                for line in &lines {
+                    let noted = format!("[queued from the user while you were working] {line}");
+                    self.agent
+                        .steer(&self.session_id, Message::user().with_text(&noted))
+                        .await;
+                }
+                for message in self.agent.take_pending_steers(&self.session_id).await {
                     self.queued_lines.push(message.as_concat_text());
                 }
             }
@@ -1671,10 +1746,6 @@ impl CliSession {
                     error: error.to_string(),
                 });
             }
-        }
-
-        if !is_json_mode && !is_stream_json_mode {
-            output::flush_markdown_buffer_current_theme(&mut markdown_buffer);
         }
 
         if is_json_mode {

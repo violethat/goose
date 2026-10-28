@@ -201,7 +201,6 @@ impl Collector {
     pub fn take_lines(&self) -> Vec<String> {
         std::mem::take(&mut *self.shared.lines.lock().unwrap())
     }
-
     /// Current input indicator for the main thread to render: the partial
     /// line while typing, or an acknowledgment note that expires on its own.
     pub fn display(&self) -> Option<String> {
@@ -263,6 +262,18 @@ impl Collector {
             .unwrap_or_default();
         let interrupted = self.cancel_token.is_cancelled();
         (lines, partial, interrupted)
+    }
+}
+
+impl Drop for Collector {
+    /// Safety net for early returns that never reach [`Collector::stop`]:
+    /// a leaked collector thread would keep reading stdin in raw
+    /// non-blocking mode forever, racing the REPL editor for keystrokes.
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -614,5 +625,35 @@ mod tests {
         let collector = collector_for(shared);
         assert_eq!(collector.take_lines(), vec!["one".to_string()]);
         assert_eq!(collector.display().as_deref(), Some("\u{00bb} two"));
+    }
+
+    /// Dropping a collector without calling stop() must still end its
+    /// thread: a leaked collector keeps stdin in raw non-blocking mode and
+    /// races the REPL editor for keystrokes.
+    #[test]
+    fn dropping_a_collector_stops_its_thread() {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(LineInput::default()),
+            lines: Mutex::new(Vec::new()),
+            display: Mutex::new(None),
+            paused: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        });
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&finished);
+        let thread_shared = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || {
+            while !thread_shared.stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            observed.store(true, Ordering::Relaxed);
+        });
+        let collector = Collector {
+            shared,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            handle: Some(handle),
+        };
+        drop(collector);
+        assert!(finished.load(Ordering::Relaxed));
     }
 }
