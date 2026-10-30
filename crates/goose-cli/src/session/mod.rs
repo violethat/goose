@@ -1501,7 +1501,6 @@ impl CliSession {
                                                 }),
                                             ));
                                             self.services
-                                                .config
                                                 .session_manager
                                                 .add_message(&self.session_id, &response_message)
                                                 .await?;

@@ -348,6 +348,10 @@ impl OpenAiProvider {
             system,
             messages,
             tools,
+            // Gateways replay assistant reasoning items because their
+            // thinking-mode backends (DeepSeek) reject tool-call turns that
+            // dropped it; native OpenAI accepts history without reasoning.
+            !self.native_openai,
         )?;
         payload["stream"] = serde_json::Value::Bool(self.supports_streaming);
         self.stream_responses_payload(model_config, payload).await
