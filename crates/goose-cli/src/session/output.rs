@@ -745,6 +745,28 @@ pub(super) fn render_tool_confirmation(
     eprintln!();
 }
 
+/// Restore blocking semantics on stdout before high-volume printing.
+///
+/// Stdin, stdout, and stderr usually share one open file description (the
+/// terminal dups a single tty open to 0/1/2), so `O_NONBLOCK` armed on stdin
+/// — typically by a spawned child that never cleared it — applies to stdout
+/// too. A full pty buffer then makes `println!` panic ("failed printing to
+/// stdout: Resource temporarily unavailable") instead of waiting for the
+/// terminal to drain. Best-effort: flag changes fail harmlessly elsewhere.
+pub fn ensure_stdout_blocking() {
+    #[cfg(unix)]
+    unsafe {
+        let flags = libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL);
+        if flags >= 0 && flags & libc::O_NONBLOCK != 0 {
+            libc::fcntl(
+                libc::STDOUT_FILENO,
+                libc::F_SETFL,
+                flags & !libc::O_NONBLOCK,
+            );
+        }
+    }
+}
+
 fn print_tool_output_line(line: &str) {
     println!("    {}", style(sanitize_terminal_line(line)).dim());
 }
@@ -753,6 +775,7 @@ fn print_tool_output(text: &str) {
     if text.is_empty() {
         return;
     }
+    ensure_stdout_blocking();
     if !std::io::stdout().is_terminal() {
         print!("{}", text);
         return;
@@ -1169,6 +1192,7 @@ pub fn env_no_color() -> bool {
 }
 
 fn print_markdown(content: &str, theme: Theme) {
+    ensure_stdout_blocking();
     if std::io::stdout().is_terminal() {
         if let Some((before, table, after)) = extract_markdown_table(content) {
             if !before.is_empty() {
