@@ -426,7 +426,12 @@ pub enum ContentBlockPart {
     },
 }
 
-fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message], supports_vision: bool) {
+fn add_message_items(
+    input_items: &mut Vec<Value>,
+    messages: &[Message],
+    supports_vision: bool,
+    preserve_thinking_context: bool,
+) {
     // Old images dominate the request body long before tokens run out;
     // keep only the most recent ones.
     let messages = super::image_retention::retain_recent_images(messages);
@@ -435,6 +440,30 @@ fn add_message_items(input_items: &mut Vec<Value>, messages: &[Message], support
             Role::User => "user",
             Role::Assistant => "assistant",
         };
+
+        // Replay assistant thinking as a reasoning item ahead of the turn's
+        // message and function_call items, mirroring the response's own item
+        // order. Gateways backed by thinking-mode models (DeepSeek) reject the
+        // whole conversation when a tool-call turn's reasoning is dropped:
+        // "The reasoning_content in the thinking mode must be passed back."
+        if preserve_thinking_context && message.role == Role::Assistant {
+            let thinking: Vec<&str> = message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    MessageContentBlock::Thinking(t) if !t.thinking.is_empty() => {
+                        Some(t.thinking.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !thinking.is_empty() {
+                input_items.push(json!({
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": thinking.join("\n")}]
+                }));
+            }
+        }
 
         let mut text_items = Vec::new();
 
@@ -645,6 +674,7 @@ pub fn create_responses_request(
         system,
         messages,
         tools,
+        false,
     )
 }
 
@@ -655,6 +685,7 @@ pub fn create_responses_request_for_model(
     system: &str,
     messages: &[Message],
     tools: &[Tool],
+    preserve_thinking_context: bool,
 ) -> anyhow::Result<Value, Error> {
     let mut input_items = Vec::new();
 
@@ -673,6 +704,7 @@ pub fn create_responses_request_for_model(
         &mut input_items,
         messages,
         model_config.supports_vision.unwrap_or_default(),
+        preserve_thinking_context,
     );
 
     let (model_name, legacy_reasoning_effort) = extract_reasoning_effort(capability_model_name);
@@ -1329,7 +1361,7 @@ mod document_tests {
 
     fn format(messages: &[Message]) -> Vec<Value> {
         let mut items = Vec::new();
-        add_message_items(&mut items, messages, true);
+        add_message_items(&mut items, messages, true, false);
         items
     }
 
@@ -1392,7 +1424,7 @@ mod image_retention_format_tests {
             .collect();
 
         let mut input_items = Vec::new();
-        add_message_items(&mut input_items, &messages, true);
+        add_message_items(&mut input_items, &messages, true, false);
 
         let serialized = serde_json::to_string(&input_items).unwrap();
         let image_count = serialized.matches("input_image").count();
@@ -3466,5 +3498,93 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("invalid arguments"));
+    }
+}
+
+#[cfg(test)]
+mod thinking_replay_tests {
+    use super::*;
+    use crate::conversation::message::Message;
+    use rmcp::model::{CallToolResult, ContentBlock};
+
+    fn thinking_turn() -> Vec<Message> {
+        vec![
+            Message::user().with_text("list the files"),
+            Message::assistant()
+                .with_thinking("I should list the files first.", "")
+                .with_text("I'll list them.")
+                .with_content(MessageContentBlock::tool_request(
+                    "call_1",
+                    Ok(CallToolRequestParams::new("shell")
+                        .with_arguments(serde_json::from_str(r#"{"command":"ls"}"#).unwrap())),
+                )),
+            Message::user().with_content(MessageContentBlock::tool_response(
+                "call_1",
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "file_a\nfile_b",
+                )])),
+            )),
+        ]
+    }
+
+    fn items_with(preserve: bool) -> Vec<Value> {
+        let model_config = ModelConfig {
+            model_name: "gpt-6-astra".to_string(),
+            context_limit: None,
+            temperature: None,
+            max_tokens: None,
+            toolshim: false,
+            toolshim_model: None,
+            request_params: None,
+            reasoning: None,
+            supports_vision: Some(true),
+            request_headers: None,
+        };
+        let spec = create_responses_request_for_model(
+            &model_config,
+            "gpt-6-astra",
+            "gpt-6-astra",
+            "system prompt",
+            &thinking_turn(),
+            &[],
+            preserve,
+        )
+        .unwrap();
+        spec["input"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn reasoning_item_precedes_the_turns_message_and_function_call() {
+        let items = items_with(true);
+        let message_index = items
+            .iter()
+            .position(|i| i["type"] == "message" && i["role"] == "assistant")
+            .expect("assistant message item");
+        let call_index = items
+            .iter()
+            .position(|i| i["type"] == "function_call")
+            .expect("function_call item");
+
+        let reasoning_index = items
+            .iter()
+            .position(|i| i["type"] == "reasoning")
+            .expect("reasoning item replayed for gateways");
+        assert!(reasoning_index < message_index);
+        assert!(reasoning_index < call_index);
+        let reasoning = &items[reasoning_index];
+        assert_eq!(reasoning["summary"][0]["type"], "summary_text");
+        assert!(reasoning["summary"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("list the files"));
+    }
+
+    #[test]
+    fn reasoning_replay_can_be_disabled_for_native_providers() {
+        let items = items_with(false);
+        assert!(
+            items.iter().all(|i| i["type"] != "reasoning"),
+            "native providers keep the old behavior: thinking dropped from input"
+        );
     }
 }
