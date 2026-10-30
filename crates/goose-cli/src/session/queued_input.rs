@@ -185,11 +185,8 @@ pub struct PauseGuard {
 impl Drop for PauseGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
-        {
-            unsafe {
-                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.raw);
-            }
-            set_stdin_nonblocking(true);
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.raw);
         }
         self.shared.paused.store(false, Ordering::Relaxed);
     }
@@ -232,7 +229,6 @@ impl Collector {
                 let original = original.assume_init();
                 libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original);
             }
-            set_stdin_nonblocking(false);
             PauseGuard {
                 shared: Arc::clone(&self.shared),
                 raw: raw_termios(),
@@ -322,29 +318,21 @@ fn raw_termios() -> libc::termios {
         // the main thread prints plain "\n" and relies on the terminal
         // driver to translate it to CRLF. cfmakeraw would break the
         // alignment of every line the session prints.
+        //
+        // VMIN=0 makes read() return immediately when nothing is pending (a
+        // polled byte can be lost to a concurrent reader between poll and
+        // read), so the thread always makes progress and stop()/join never
+        // hangs. Arming O_NONBLOCK on the fd instead would silently apply to
+        // stdout too — the terminal dups one tty open to 0/1/2, sharing the
+        // file description — and the first println! on a full pty buffer
+        // then panics with EAGAIN.
         raw.c_iflag &=
             !(libc::ICRNL | libc::IXON | libc::INLCR | libc::IGNCR | libc::ISTRIP | libc::BRKINT);
         raw.c_lflag &=
             !(libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ICANON | libc::ISIG | libc::IEXTEN);
-        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
         raw
-    }
-}
-
-#[cfg(unix)]
-fn set_stdin_nonblocking(nonblocking: bool) {
-    unsafe {
-        let flags = libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL);
-        if flags < 0 {
-            return;
-        }
-        let flags = if nonblocking {
-            flags | libc::O_NONBLOCK
-        } else {
-            flags & !libc::O_NONBLOCK
-        };
-        libc::fcntl(libc::STDIN_FILENO, libc::F_SETFL, flags);
     }
 }
 
@@ -359,7 +347,6 @@ impl Drop for TerminalRestore {
     fn drop(&mut self) {
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
-            set_stdin_nonblocking(false);
         }
     }
 }
@@ -379,7 +366,6 @@ fn run(shared: Arc<Shared>, cancel_token: CancellationToken) {
     unsafe {
         libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
     }
-    set_stdin_nonblocking(true);
 
     let mut pollfd = libc::pollfd {
         fd: libc::STDIN_FILENO,

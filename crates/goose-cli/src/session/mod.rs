@@ -1614,6 +1614,9 @@ impl CliSession {
                         }
                     }
                     _ = tokio::time::sleep(Duration::from_millis(80)), if queued_collector.is_some() => {
+                        // A spawned tool can leave the shared tty file
+                        // description non-blocking; heal before further prints.
+                        output::ensure_stdout_blocking();
                         let Some(collector) = queued_collector.as_ref() else {
                             continue;
                         };
