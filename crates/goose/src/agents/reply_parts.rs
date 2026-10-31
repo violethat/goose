@@ -349,10 +349,7 @@ pub(crate) async fn stream_response_from_provider(
                             attempts, retry_config.max_retries, error
                         );
 
-                        let skip_backoff = std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
-                            .unwrap_or_default()
-                            .parse::<bool>()
-                            .unwrap_or(false);
+                        let skip_backoff = goose_providers::retry::backoff_skipped_by_env();
                         if !skip_backoff {
                             tokio::time::sleep(delay).await;
                         }

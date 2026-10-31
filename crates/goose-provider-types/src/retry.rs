@@ -116,6 +116,16 @@ pub fn should_retry(error: &ProviderError, config: &RetryConfig) -> bool {
     }
 }
 
+/// Whether `GOOSE_PROVIDER_SKIP_BACKOFF` asks retry loops to skip their
+/// sleep. Intended for tests that exercise retry behavior without paying
+/// real backoff time.
+pub fn backoff_skipped_by_env() -> bool {
+    std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
+        .unwrap_or_default()
+        .parse::<bool>()
+        .unwrap_or(false)
+}
+
 pub async fn retry_operation<F, Fut, T>(
     config: &RetryConfig,
     operation: F,
@@ -249,10 +259,7 @@ impl<P: Provider> ProviderRetry for P {
                             _ => config.delay_for_attempt(attempts),
                         };
 
-                        let skip_backoff = std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
-                            .unwrap_or_default()
-                            .parse::<bool>()
-                            .unwrap_or(false);
+                        let skip_backoff = backoff_skipped_by_env();
 
                         if skip_backoff {
                             tracing::info!("Skipping backoff due to GOOSE_PROVIDER_SKIP_BACKOFF");

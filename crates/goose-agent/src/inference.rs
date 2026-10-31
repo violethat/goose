@@ -436,6 +436,9 @@ impl<'a, S: MaybeSync, E: InferenceEffect> InferenceRunner<'a, S, E> {
         delay: std::time::Duration,
         emit: &Emitter,
     ) -> bool {
+        if goose_provider_types::retry::backoff_skipped_by_env() {
+            return !emit.cancel_token().is_cancelled();
+        }
         tokio::select! {
             _ = tokio::time::sleep(delay) => true,
             _ = emit.cancelled() => false,

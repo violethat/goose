@@ -808,6 +808,13 @@ async fn test_pipeline_with_components(
     session_manager: Arc<SessionManager>,
     scheduler: Option<Arc<dyn crate::scheduler_trait::SchedulerTrait>>,
 ) -> Result<(TestPipeline, Arc<DummyApi>)> {
+    // Error-path tests script real provider failures; without this the
+    // enlarged default retry budget would sleep through minutes of backoff
+    // per scripted failure. Retry *counts* stay untouched.
+    static SKIP_BACKOFF: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    SKIP_BACKOFF.get_or_init(|| {
+        std::env::set_var("GOOSE_PROVIDER_SKIP_BACKOFF", "true");
+    });
     let api = Arc::new(DummyApi::start(features).await);
     let session = session_manager
         .create_session(
