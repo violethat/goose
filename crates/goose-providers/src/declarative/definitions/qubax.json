@@ -181,6 +181,17 @@
       "reasoning": true
     },
     {
+      "name": "deepseek-v4.1-flash-uncensored",
+      "context_limit": 1048576,
+      "input_token_cost": 2e-09,
+      "output_token_cost": 8e-09,
+      "currency": "USD",
+      "cache_read_token_cost": 4e-11,
+      "supports_cache_control": true,
+      "supports_vision": true,
+      "reasoning": true
+    },
+    {
       "name": "deepseek-v4.1-flash-1017",
       "context_limit": 1048576,
       "input_token_cost": 4.4953e-08,
@@ -712,6 +723,17 @@
     },
     {
       "name": "kimi-k3",
+      "context_limit": 1000000,
+      "input_token_cost": 4.31e-08,
+      "output_token_cost": 1.194378e-06,
+      "currency": "USD",
+      "cache_read_token_cost": 3.787e-08,
+      "supports_cache_control": true,
+      "supports_vision": true,
+      "reasoning": true
+    },
+    {
+      "name": "kimi-k3.1-pro",
       "context_limit": 1000000,
       "input_token_cost": 4.31e-08,
       "output_token_cost": 1.194378e-06,
