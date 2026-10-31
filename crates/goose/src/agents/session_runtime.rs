@@ -172,6 +172,21 @@ impl SessionRuntime {
             .remove(session_id);
     }
 
+    /// Take back steer messages that a finished turn never consumed, so the
+    /// caller can deliver them itself (for example as a follow-up turn).
+    pub(super) async fn take_pending_steers(&self, session_id: &str) -> Vec<Message> {
+        let Some(queue) = self
+            .steer_queues
+            .lock()
+            .expect("session runtime poisoned")
+            .remove(session_id)
+        else {
+            return Vec::new();
+        };
+        let mut guard = queue.lock().await;
+        guard.drain(..).collect()
+    }
+
     /// Whether an eviction candidate must stay: touched again since it was chosen, or busy
     /// (then it goes back to the resident set).
     pub(super) fn keep_resident(&self, session_id: &str) -> bool {

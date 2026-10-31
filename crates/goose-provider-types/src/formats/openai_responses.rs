@@ -1494,7 +1494,7 @@ mod image_retention_format_tests {
             .collect();
 
         let mut input_items = Vec::new();
-        add_message_items(&mut input_items, &messages, true, false);
+        add_message_items(&mut input_items, &messages, true, "gpt-5.6", false);
 
         let serialized = serde_json::to_string(&input_items).unwrap();
         let image_count = serialized.matches("input_image").count();

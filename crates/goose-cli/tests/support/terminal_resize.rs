@@ -33,6 +33,10 @@ const REPAINT: &[u8] = b"\x1b[K";
 struct Prompt {
     child: Child,
     tty: File,
+    // Bytes already read off the pty but not consumed by a matcher yet: one
+    // read can span several protocol markers, so leftovers must survive
+    // between waits instead of being dropped with each wait's buffer.
+    pending: Vec<u8>,
     // The CLI writes its config under here, and the child outlives the test body.
     _home: tempfile::TempDir,
 }
@@ -87,6 +91,7 @@ impl Prompt {
         Self {
             child,
             tty,
+            pending: Vec::new(),
             _home: home,
         }
     }
@@ -112,26 +117,33 @@ impl Prompt {
 
     /// Read until `needle` has been painted, so actions only follow a settled prompt.
     fn wait_for_paint(&mut self, needle: &[u8], timeout: Duration) {
-        let mut seen: Vec<u8> = Vec::new();
         let deadline = Instant::now() + timeout;
-        while !contains(&seen, needle) {
+        loop {
+            if let Some(at) = find(&self.pending, needle) {
+                self.pending.drain(..at + needle.len());
+                return;
+            }
             if self.child_gone() {
-                panic!("prompt child exited while waiting for {needle:?}, saw {seen:?}");
+                panic!(
+                    "prompt child exited while waiting for {needle:?}, saw {:?}",
+                    self.pending
+                );
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
                 !remaining.is_zero(),
-                "timed out waiting for {needle:?}, saw {seen:?}"
+                "timed out waiting for {needle:?}, saw {:?}",
+                self.pending
             );
             if readable(self.tty.as_raw_fd(), remaining) {
-                seen.extend_from_slice(&read_chunk(&mut self.tty));
+                self.pending.extend_from_slice(&read_chunk(&mut self.tty));
             }
         }
     }
 
     /// Everything painted until the terminal goes quiet, or `overall` elapses.
     fn paint(&mut self, quiet: Duration, overall: Duration) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut bytes = std::mem::take(&mut self.pending);
         let deadline = Instant::now() + overall;
         while Instant::now() < deadline && !self.child_gone() {
             if !readable(self.tty.as_raw_fd(), quiet) {
@@ -226,6 +238,14 @@ fn drain(reader: &mut File) {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Offset of `needle` within `haystack`, if present.
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[test]

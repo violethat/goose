@@ -1751,7 +1751,7 @@ impl CliSession {
                         .dim()
                     );
                 }
-                self.services.discard_pending_steers(&self.session_id).await;
+                self.services.discard_pending_steers(&self.session_id);
             } else {
                 for line in &lines {
                     let noted = format!("[queued from the user while you were working] {line}");
