@@ -1443,6 +1443,13 @@ impl CliSession {
                                 }
                                 if let Some(confirmation_request) = find_tool_confirmation(&message) {
                                     let selected_permission = if interactive {
+                                        // The permission prompt's own UI must own
+                                        // the whole terminal bottom: clear the
+                                        // trailing indicator line and any MCP
+                                        // bars before it draws, or their cursor
+                                        // accounting interleave with it.
+                                        output::queued_line_erase();
+                                        let _ = progress_bars.hide();
                                         program_status::report(
                                             ProgramStatus::Blocked(BlockedKind::Permission),
                                             Some(&confirmation_request.tool_name),
@@ -1604,6 +1611,16 @@ impl CliSession {
                                             interactive,
                                             &mut prompted_credits_urls,
                                         );
+                                        // Hand the indicator back to its trailing
+                                        // line: the render's own prints erased
+                                        // it (if it drew anything), and the
+                                        // sync re-draws it once the stream
+                                        // allows — immediately for events that
+                                        // printed nothing, after the quiet
+                                        // window otherwise.
+                                        if let Some(collector) = queued_collector.as_ref() {
+                                            output::queued_line_sync(collector.display());
+                                        }
                                     }
                                 }
                             }
@@ -1612,6 +1629,7 @@ impl CliSession {
                             }
                             Some(Ok(AgentEvent::MessageUsage { .. })) => {}
                             Some(Ok(AgentEvent::McpNotification((extension_id, notification)))) => {
+                                output::queued_line_erase();
                                 handle_mcp_notification(
                                     &extension_id,
                                     &notification,
@@ -1627,6 +1645,7 @@ impl CliSession {
                             }
                             Some(Err(e)) => {
                                 if interactive || !is_stream_json_mode {
+                                    output::queued_line_erase();
                                     handle_agent_error(&e, is_stream_json_mode);
                                 }
                                 cancel_token_clone.cancel();
@@ -1661,19 +1680,33 @@ impl CliSession {
                                 .steer(&self.session_id, Message::user().with_text(&noted))
                                 .await;
                         }
-                        // Render the typed-input indicator through whichever
-                        // spinner owns the screen right now; the collector
+                        // Render the typed-input indicator on whichever
+                        // surface owns the screen right now; the collector
                         // itself never writes to the terminal.
                         let display = collector.display();
                         if output::thinking_is_shown() {
                             output::set_thinking_user_input(display);
                             progress_bars.set_user_input(None);
-                        } else {
+                        } else if progress_bars.has_activity() {
+                            // MCP bars own the terminal bottom: ride the
+                            // multi-progress input bar, whose redraws are
+                            // coordinated with theirs.
+                            output::queued_line_erase();
                             output::set_thinking_user_input(None);
                             progress_bars.set_user_input(display);
+                        } else {
+                            // Nothing owns the bottom: draw a plain trailing
+                            // line in the stdout flow. Spinner homes would
+                            // flash here — every message event clears all
+                            // bars before printing, so a bar-based indicator
+                            // would toggle at message rate.
+                            output::set_thinking_user_input(None);
+                            progress_bars.set_user_input(None);
+                            output::queued_line_sync(display);
                         }
                     }
                     _ = cancel_token_clone.cancelled() => {
+                        output::queued_line_erase();
                         drain_stopped_run(&mut stream, &mut self.messages, &mut last_usage).await;
                         drop(stream);
                         if let Err(e) = self.handle_interrupted_messages(true).await {
@@ -1687,6 +1720,7 @@ impl CliSession {
             // This reply is done: flush its pending markdown, then decide
             // whether queued lines start another reply.
             if !is_json_mode && !is_stream_json_mode {
+                output::queued_line_erase();
                 output::flush_markdown_buffer_current_theme(&mut markdown_buffer);
             }
 
@@ -1732,6 +1766,7 @@ impl CliSession {
         // that were too late for a follow-up reply are kept for the next
         // turn rather than dropped.
         if let Some(collector) = queued_collector.take() {
+            output::queued_line_erase();
             let (lines, partial, interrupted) = collector.stop();
             if !partial.is_empty() {
                 println!(
@@ -2821,7 +2856,7 @@ fn display_log_notification(
             }
         }
     } else if output::is_showing_thinking() {
-        output::set_thinking_message(&formatted_message.to_string());
+        output::set_thinking_message(formatted_message);
     } else {
         progress_bars.log(formatted_message);
     }

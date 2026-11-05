@@ -25,6 +25,25 @@ use std::time::Duration;
 
 use super::streaming_buffer::MarkdownBuffer;
 
+#[cfg(all(test, unix))]
+#[path = "../../tests/support/queued_line_signals.rs"]
+mod queued_line_signals;
+
+/// A println in the streaming render path. Rendering happens while the
+/// queued-input trailing line may be visible at the bottom of the screen:
+/// each print must first clear it (or the new content would land beneath
+/// it) and then record that output ended at a line start so the indicator
+/// can be redrawn. Riding the actual prints — instead of clearing once per
+/// message event — is what keeps non-printing stream deltas from blinking
+/// the indicator.
+macro_rules! renderln {
+    ($($arg:tt)*) => {{
+        queued_line_erase();
+        println!($($arg)*);
+        queued_line_at_line_start();
+    }};
+}
+
 pub const DEFAULT_MIN_PRIORITY: f32 = 0.0;
 pub const DEFAULT_CLI_LIGHT_THEME: &str = "GitHub";
 pub const DEFAULT_CLI_DARK_THEME: &str = "zenburn";
@@ -168,6 +187,12 @@ pub struct ThinkingIndicator {
 
 impl ThinkingIndicator {
     pub fn show(&mut self) {
+        if self.spinner.is_some() {
+            // Already visible. Recreating here would orphan the old bar's
+            // drawn line (nothing would clear it) and blank the queued-input
+            // indicator until the next tick repaints it.
+            return;
+        }
         let spinner = cliclack::spinner();
         let hint = style("(Ctrl+C to interrupt)").dim();
         let base_message = if Config::global()
@@ -207,6 +232,15 @@ impl ThinkingIndicator {
             return;
         }
         self.user_input = input;
+        self.redraw();
+    }
+
+    fn set_message(&mut self, message: &str) {
+        self.base_message = message.to_string();
+        self.redraw();
+    }
+
+    fn redraw(&self) {
         let Some(spinner) = &self.spinner else {
             return;
         };
@@ -233,6 +267,7 @@ thread_local! {
 
 pub fn show_thinking() {
     if std::io::stdout().is_terminal() {
+        queued_line_erase();
         THINKING.with(|t| t.borrow_mut().show());
     }
 }
@@ -251,6 +286,188 @@ pub fn set_thinking_user_input(input: Option<String>) {
     if std::io::stdout().is_terminal() {
         THINKING.with(|t| t.borrow_mut().set_user_input(input));
     }
+}
+
+/// Queued-input indicator for streaming phases, drawn as a trailing line in
+/// the normal stdout flow.
+///
+/// The indicator otherwise lives in one of two spinner pipelines (the
+/// cliclack thinking spinner, the indicatif MultiProgress) that each erase
+/// and redraw the terminal bottom on their own cursor accounting. While the
+/// model streams, message chunks are printed to stdout between their draws,
+/// so those homes either toggle (each message event clears every bar before
+/// rendering, and the next 80ms tick re-adds the indicator) or land their
+/// cursor math on the wrong lines — reading as flashing and eaten text.
+/// As a plain trailing line the indicator needs no cursor accounting of its
+/// own: erase and reprint happen in one write, only when the text changed,
+/// and it hands the terminal back exactly at a line start.
+#[derive(Default)]
+struct QueuedLine {
+    /// Indicator text currently visible as the last stdout line, if any.
+    shown: Option<String>,
+    /// The last render left the cursor mid-line (streaming reasoning
+    /// deltas are printed without a newline), so the trailing line can be
+    /// neither drawn nor erased.
+    mid_line: bool,
+    /// When stdout last moved. While the model streams, the markdown
+    /// buffer emits word-granular chunks that leave the cursor mid-line;
+    /// drawing the indicator then would share (and on erase, eat) the
+    /// text's row. The indicator may only draw once the stream is quiet
+    /// and parked at a line start.
+    last_output: Option<std::time::Instant>,
+}
+
+/// How long the stream must be silent before the indicator may draw.
+const QUEUED_LINE_QUIET: Duration = Duration::from_millis(600);
+
+thread_local! {
+    static QUEUED_LINE: RefCell<QueuedLine> = RefCell::new(QueuedLine::default());
+}
+
+/// What [`queued_line_sync`] should do, decided purely so it can be tested.
+#[derive(Debug, PartialEq, Eq)]
+enum QueuedLinePlan {
+    /// Nothing to change.
+    Skip,
+    /// Remove the visible trailing line.
+    Erase,
+    /// Print `text` on a fresh trailing line.
+    Print(String),
+    /// Replace the visible trailing line with `text` in one write.
+    Replace(String),
+}
+
+fn queued_line_plan(
+    display: &Option<String>,
+    state: &QueuedLine,
+    thinking_shown: bool,
+    terminal_width: u16,
+) -> QueuedLinePlan {
+    if state.mid_line {
+        return QueuedLinePlan::Skip;
+    }
+    let quiet = state
+        .last_output
+        .is_none_or(|at| at.elapsed() >= QUEUED_LINE_QUIET);
+    if !quiet {
+        return QueuedLinePlan::Skip;
+    }
+    if thinking_shown {
+        return if state.shown.is_some() {
+            QueuedLinePlan::Erase
+        } else {
+            QueuedLinePlan::Skip
+        };
+    }
+    match (display, state.shown.as_ref()) {
+        (Some(text), shown) => {
+            let fitted = fit_queued_line(text, terminal_width);
+            if shown.is_some_and(|shown| *shown == fitted) {
+                QueuedLinePlan::Skip
+            } else if state.shown.is_some() {
+                QueuedLinePlan::Replace(fitted)
+            } else {
+                QueuedLinePlan::Print(fitted)
+            }
+        }
+        (None, Some(_)) => QueuedLinePlan::Erase,
+        (None, None) => QueuedLinePlan::Skip,
+    }
+}
+
+/// Trim the indicator to one terminal row, keeping the typed tail: the line
+/// must occupy exactly one row or the single-line erase would eat the row
+/// above it.
+fn fit_queued_line(text: &str, terminal_width: u16) -> String {
+    const INDENT: usize = 2;
+    let width = terminal_width as usize;
+    if width <= INDENT + 1 {
+        return text.chars().last().map(String::from).unwrap_or_default();
+    }
+    let budget = width - INDENT;
+    if console::measure_text_width(text) <= budget {
+        return text.to_string();
+    }
+    let mut kept = String::new();
+    let mut used = 0;
+    for ch in text.chars().rev() {
+        let ch_width = console::measure_text_width(&ch.to_string());
+        if used + ch_width > budget - 1 {
+            break;
+        }
+        used += ch_width;
+        kept.insert(0, ch);
+    }
+    format!("…{kept}")
+}
+
+/// ANSI sequence moving to the previous row and clearing it. The cursor is
+/// left at the row start: printing after an erase continues exactly there.
+const QUEUED_LINE_ERASE_SEQ: &str = "\x1b[1A\x1b[2K";
+
+fn queued_line_write(parts: &str) {
+    ensure_stdout_blocking();
+    print!("{parts}");
+    let _ = std::io::stdout().flush();
+}
+
+pub fn queued_line_erase() {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    QUEUED_LINE.with(|q| {
+        if q.borrow_mut().shown.take().is_some() {
+            queued_line_write(QUEUED_LINE_ERASE_SEQ);
+        }
+    });
+}
+
+/// Draw, update, or clear the trailing indicator to match `display`.
+pub fn queued_line_sync(display: Option<String>) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let thinking_shown = THINKING.with(|t| t.borrow().is_shown());
+    let terminal_width = console::Term::stdout().size().1;
+    let plan = QUEUED_LINE.with(|q| {
+        let plan = queued_line_plan(&display, &q.borrow(), thinking_shown, terminal_width);
+        let mut state = q.borrow_mut();
+        state.shown = match &plan {
+            QueuedLinePlan::Skip => state.shown.take(),
+            QueuedLinePlan::Erase => None,
+            QueuedLinePlan::Print(text) | QueuedLinePlan::Replace(text) => Some(text.clone()),
+        };
+        plan
+    });
+    match plan {
+        QueuedLinePlan::Skip => {}
+        QueuedLinePlan::Erase => queued_line_write(QUEUED_LINE_ERASE_SEQ),
+        QueuedLinePlan::Print(text) => queued_line_write(&format!("  {}\n", style(&text).dim())),
+        QueuedLinePlan::Replace(text) => queued_line_write(&format!(
+            "{QUEUED_LINE_ERASE_SEQ}  {}\n",
+            style(&text).dim()
+        )),
+    }
+}
+
+/// Mark that the cursor sits mid-line, so the trailing indicator must not
+/// draw until a newline-terminated render resets it.
+pub fn queued_line_mid_stream() {
+    QUEUED_LINE.with(|q| {
+        let mut q = q.borrow_mut();
+        q.mid_line = true;
+        q.last_output = Some(std::time::Instant::now());
+    });
+}
+
+/// Mark that stdout output ended at a line start, so the trailing indicator
+/// may draw once the stream has also gone quiet.
+pub fn queued_line_at_line_start() {
+    QUEUED_LINE.with(|q| {
+        let mut q = q.borrow_mut();
+        q.mid_line = false;
+        q.last_output = Some(std::time::Instant::now());
+    });
 }
 
 pub fn show_loading_extensions_background() {
@@ -324,13 +541,9 @@ pub fn is_showing_thinking() -> bool {
     THINKING.with(|t| t.borrow().is_shown())
 }
 
-pub fn set_thinking_message(s: &String) {
+pub fn set_thinking_message(s: &str) {
     if std::io::stdout().is_terminal() {
-        THINKING.with(|t| {
-            if let Some(spinner) = t.borrow_mut().spinner.as_mut() {
-                spinner.set_message(s);
-            }
-        });
+        THINKING.with(|t| t.borrow_mut().set_message(s));
     }
 }
 
@@ -417,7 +630,7 @@ pub fn render_message_streaming(
     for content in &message.content {
         if !matches!(content, MessageContent::Thinking(_)) {
             if *thinking_header_shown {
-                println!();
+                renderln!();
             }
             *thinking_header_shown = false;
         }
@@ -440,29 +653,29 @@ pub fn render_message_streaming(
                 flush_markdown_buffer(buffer, theme);
                 match &action.data {
                     ActionRequiredData::ToolConfirmation { tool_name, .. } => {
-                        println!("action_required(tool_confirmation): {}", tool_name)
+                        renderln!("action_required(tool_confirmation): {}", tool_name)
                     }
                     ActionRequiredData::Elicitation { message, .. } => {
-                        println!("action_required(elicitation): {}", message)
+                        renderln!("action_required(elicitation): {}", message)
                     }
                     ActionRequiredData::ElicitationResponse { id, .. } => {
-                        println!("action_required(elicitation_response): {}", id)
+                        renderln!("action_required(elicitation_response): {}", id)
                     }
                     ActionRequiredData::ToolConfirmationResponse { id, .. } => {
-                        println!("action_required(tool_confirmation_response): {}", id)
+                        renderln!("action_required(tool_confirmation_response): {}", id)
                     }
                 }
             }
             MessageContent::Image(image) => {
                 flush_markdown_buffer(buffer, theme);
-                println!("Image: [data: {}, type: {}]", image.data, image.mime_type);
+                renderln!("Image: [data: {}, type: {}]", image.data, image.mime_type);
             }
             MessageContent::Thinking(t) => {
                 render_thinking_streaming(&t.thinking, buffer, thinking_header_shown, theme);
             }
             MessageContent::RedactedThinking(_) => {
                 flush_markdown_buffer(buffer, theme);
-                println!("\n{}", style("Thinking:").dim().italic());
+                renderln!("\n{}", style("Thinking:").dim().italic());
                 print_markdown("Thinking was redacted", theme);
             }
             MessageContent::SystemNotification(notification) => {
@@ -475,7 +688,7 @@ pub fn render_message_streaming(
                     SystemNotificationType::InlineMessage => {
                         flush_markdown_buffer(buffer, theme);
                         hide_thinking();
-                        println!("\n{} {}", style("·").dim(), &notification.msg);
+                        renderln!("\n{} {}", style("·").dim(), &notification.msg);
                     }
                     SystemNotificationType::CreditsExhausted => {
                         flush_markdown_buffer(buffer, theme);
@@ -486,11 +699,11 @@ pub fn render_message_streaming(
             MessageContent::Error(error) => {
                 flush_markdown_buffer(buffer, theme);
                 hide_thinking();
-                println!("\n{} {}", danger("error:").bold(), &error.message);
+                renderln!("\n{} {}", danger("error:").bold(), &error.message);
             }
             _ => {
                 flush_markdown_buffer(buffer, theme);
-                eprintln!("WARNING: Message content type could not be rendered");
+                renderln!("WARNING: Message content type could not be rendered");
             }
         }
     }
@@ -507,12 +720,12 @@ fn reached_output_token_limit(message: &Message) -> bool {
 }
 
 fn render_output_token_limit_warning() {
-    println!("\n{}", warning(OUTPUT_TOKEN_LIMIT_WARNING));
+    renderln!("\n{}", warning(OUTPUT_TOKEN_LIMIT_WARNING));
 }
 
 fn render_credits_exhausted_notification(notification: &SystemNotificationContent) {
     hide_thinking();
-    println!("\n{} {}", warning("warning:").bold(), &notification.msg);
+    renderln!("\n{} {}", warning("warning:").bold(), &notification.msg);
 
     if let Some(url) = notification
         .data
@@ -520,7 +733,7 @@ fn render_credits_exhausted_notification(notification: &SystemNotificationConten
         .and_then(|d| d.get("top_up_url"))
         .and_then(|v| v.as_str())
     {
-        println!("{} {}", style("top up:").dim(), accent(url));
+        renderln!("{} {}", style("top up:").dim(), accent(url));
     }
 }
 
@@ -590,7 +803,7 @@ fn should_show_thinking() -> bool {
 
 fn render_thinking(text: &str, theme: Theme) {
     if should_show_thinking() && !text.is_empty() {
-        println!("\n{}", style("Thinking:").dim().italic());
+        renderln!("\n{}", style("Thinking:").dim().italic());
         print_markdown(text, theme);
     }
 }
@@ -604,10 +817,12 @@ fn render_thinking_streaming(
     if should_show_thinking() && !text.is_empty() {
         flush_markdown_buffer(buffer, theme);
         if !*header_shown {
-            println!("\n{}", style("Thinking:").dim().italic());
+            renderln!("\n{}", style("Thinking:").dim().italic());
             *header_shown = true;
         }
+        queued_line_erase();
         print!("{}", style(text).dim());
+        queued_line_mid_stream();
         let _ = std::io::stdout().flush();
     }
 }
@@ -628,6 +843,7 @@ fn render_tool_request(req: &ToolRequest, theme: Theme, debug: bool) {
         },
         Err(e) => print_markdown(&e.to_string(), theme),
     }
+    queued_line_at_line_start();
 }
 
 fn render_tool_response(resp: &ToolResponse, debug: bool) {
@@ -664,14 +880,14 @@ fn render_tool_response(resp: &ToolResponse, debug: bool) {
                 }
 
                 if debug {
-                    println!("{:#?}", content);
+                    renderln!("{:#?}", content);
                 } else if let Some(text) = content.as_text() {
                     print_tool_output(&text.text);
                 }
             }
         }
         Err(e) => {
-            println!("    {}", style(e.to_string()).red().dim());
+            renderln!("    {}", style(e.to_string()).red().dim());
         }
     }
 }
@@ -768,7 +984,7 @@ pub fn ensure_stdout_blocking() {
 }
 
 fn print_tool_output_line(line: &str) {
-    println!("    {}", style(sanitize_terminal_line(line)).dim());
+    renderln!("    {}", style(sanitize_terminal_line(line)).dim());
 }
 
 fn print_tool_output(text: &str) {
@@ -796,7 +1012,7 @@ fn print_tool_output(text: &str) {
         for line in &lines[..head] {
             print_tool_output_line(line);
         }
-        println!(
+        renderln!(
             "    {}",
             style(format!(
                 "... ({} lines hidden, /toggle to show all)",
@@ -911,7 +1127,7 @@ fn render_text_editor_request(call: &CallToolRequestParams, debug: bool) {
 
     if let Some(args) = &call.arguments {
         if let Some(Value::String(path)) = args.get("path") {
-            println!(
+            renderln!(
                 "    {} {}",
                 style("path").dim(),
                 style(shorten_path(path, debug)).dim()
@@ -930,13 +1146,13 @@ fn render_text_editor_request(call: &CallToolRequestParams, debug: bool) {
             }
         }
     }
-    println!();
+    renderln!();
 }
 
 fn render_shell_request(call: &CallToolRequestParams, debug: bool) {
     print_tool_header(call);
     print_params(&call.arguments, 1, debug);
-    println!();
+    renderln!();
 }
 
 fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
@@ -953,8 +1169,8 @@ fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
 
     let count = tool_graph.len();
     let plural = if count == 1 { "" } else { "s" };
-    println!();
-    println!(
+    renderln!();
+    renderln!(
         "  {} {} {} tool call{}",
         style("▸").dim(),
         style("execute").dim(),
@@ -984,7 +1200,7 @@ fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
         } else {
             format!(" (uses {})", deps.join(", "))
         };
-        println!(
+        renderln!(
             "    {}. {} {}{}",
             style(i + 1).dim(),
             style(tool).dim(),
@@ -1000,10 +1216,10 @@ fn render_execute_code_request(call: &CallToolRequestParams, debug: bool) {
         .and_then(Value::as_str)
         .filter(|c| !c.is_empty());
     if code.is_some_and(|_| debug) {
-        println!("{}", code.unwrap_or_default());
+        renderln!("{}", code.unwrap_or_default());
     }
 
-    println!();
+    renderln!();
 }
 
 fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
@@ -1011,7 +1227,7 @@ fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
 
     if let Some(args) = &call.arguments {
         if let Some(Value::String(source)) = args.get("source") {
-            println!("    {} {}", style("source").dim(), style(source).dim());
+            renderln!("    {} {}", style("source").dim(), style(source).dim());
         }
 
         if let Some(Value::String(instructions)) = args.get("instructions") {
@@ -1020,7 +1236,7 @@ fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
             } else {
                 instructions.clone()
             };
-            println!(
+            renderln!(
                 "    {} {}",
                 style("instructions").dim(),
                 style(display).dim()
@@ -1028,7 +1244,7 @@ fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
         }
 
         if let Some(Value::Object(params)) = args.get("parameters") {
-            println!("    {}:", style("parameters").dim());
+            renderln!("    {}:", style("parameters").dim());
             print_params(&Some(params.clone()), 2, debug);
         }
 
@@ -1044,7 +1260,7 @@ fn render_delegate_request(call: &CallToolRequestParams, debug: bool) {
         }
     }
 
-    println!();
+    renderln!();
 }
 
 fn render_todo_request(call: &CallToolRequestParams, _debug: bool) {
@@ -1052,16 +1268,16 @@ fn render_todo_request(call: &CallToolRequestParams, _debug: bool) {
 
     if let Some(args) = &call.arguments {
         if let Some(Value::String(content)) = args.get("content") {
-            println!("    {} {}", style("content").dim(), style(content).dim());
+            renderln!("    {} {}", style("content").dim(), style(content).dim());
         }
     }
-    println!();
+    renderln!();
 }
 
 fn render_default_request(call: &CallToolRequestParams, debug: bool) {
     print_tool_header(call);
     print_params(&call.arguments, 1, debug);
-    println!();
+    renderln!();
 }
 
 fn extension_display_name(name: &str) -> &str {
@@ -1112,10 +1328,10 @@ pub fn render_subagent_tool_call(
         style("▸").dim(),
         style(format_subagent_tool_call_message(subagent_id, tool_name)).dim(),
     );
-    println!();
-    println!("{}", tool_header);
+    renderln!();
+    renderln!("{}", tool_header);
     print_params(&arguments.cloned(), 1, debug);
-    println!();
+    renderln!();
 }
 
 fn render_subagent_tool_graph(subagent_id: &str, tool_name: &str, tool_graph: &[Value]) {
@@ -1180,9 +1396,9 @@ fn print_tool_header(call: &CallToolRequestParams) {
         ),
         None => format!("  {} {}", style("▸").dim(), style(parts.tool_name).dim()),
     };
-    println!();
-    println!("  {}", style("─".repeat(40)).dim());
-    println!("{}", tool_header);
+    renderln!();
+    renderln!("  {}", style("─".repeat(40)).dim());
+    renderln!("{}", tool_header);
 }
 
 // Respect NO_COLOR, as https://crates.io/crates/console already does
@@ -1193,6 +1409,7 @@ pub fn env_no_color() -> bool {
 
 fn print_markdown(content: &str, theme: Theme) {
     ensure_stdout_blocking();
+    queued_line_erase();
     if std::io::stdout().is_terminal() {
         if let Some((before, table, after)) = extract_markdown_table(content) {
             if !before.is_empty() {
@@ -1207,6 +1424,14 @@ fn print_markdown(content: &str, theme: Theme) {
         }
     } else {
         print!("{}", content);
+    }
+    // The markdown buffer emits word-granular chunks mid-paragraph: those
+    // leave the cursor mid-line, and the trailing indicator must not draw
+    // on a row it would later have to erase into.
+    if content.ends_with('\n') {
+        queued_line_at_line_start();
+    } else {
+        queued_line_mid_stream();
     }
 }
 
@@ -1435,7 +1660,7 @@ fn print_params(value: &Option<JsonObject>, depth: usize, debug: bool) {
         for (key, val) in json_object.iter() {
             match val {
                 Value::Object(obj) => {
-                    println!("{}{}:", indent, style(key).dim());
+                    renderln!("{}{}:", indent, style(key).dim());
                     print_params(&Some(obj.clone()), depth + 1, debug);
                 }
                 Value::Array(arr) => {
@@ -1467,13 +1692,13 @@ fn print_params(value: &Option<JsonObject>, depth: usize, debug: bool) {
                         );
                     } else {
                         // Use the original multi-line format for complex arrays
-                        println!("{}{}:", indent, style(key).dim());
+                        renderln!("{}{}:", indent, style(key).dim());
                         for item in arr.iter() {
                             if let Value::Object(obj) = item {
-                                println!("{}{}- ", indent, INDENT);
+                                renderln!("{}{}- ", indent, INDENT);
                                 print_params(&Some(obj.clone()), depth + 2, debug);
                             } else {
-                                println!("{}{}- {}", indent, INDENT, item);
+                                renderln!("{}{}- {}", indent, INDENT, item);
                             }
                         }
                     }
@@ -1758,6 +1983,14 @@ impl McpSpinners {
         }
     }
 
+    /// Whether any bar other than the queued-input indicator is drawing.
+    /// The queued-input tick parks the indicator on the input bar only
+    /// while MCP bars own the terminal bottom; otherwise the indicator
+    /// rides a plain trailing stdout line instead of this block.
+    pub fn has_activity(&self) -> bool {
+        self.log_spinner.is_some() || !self.bars.is_empty()
+    }
+
     /// Update the live queued-input indicator on its own bar, independent of
     /// the log spinner: created on first use, removed when cleared, never
     /// tied to MCP notification or message-render churn.
@@ -1857,6 +2090,115 @@ mod tests {
         }
 
         assert_eq!(rendered, "two\n  three\n  four");
+    }
+
+    #[test]
+    fn queued_line_prints_when_nothing_is_shown() {
+        let state = QueuedLine::default();
+        let plan = queued_line_plan(&Some("» hi".into()), &state, false, 80);
+        assert_eq!(plan, QueuedLinePlan::Print("» hi".into()));
+    }
+
+    #[test]
+    fn queued_line_replaces_only_when_text_changes() {
+        let state = QueuedLine {
+            shown: Some("» hi".into()),
+            mid_line: false,
+            last_output: None,
+        };
+        assert_eq!(
+            queued_line_plan(&Some("» hi".into()), &state, false, 80),
+            QueuedLinePlan::Skip
+        );
+        assert_eq!(
+            queued_line_plan(&Some("» hello".into()), &state, false, 80),
+            QueuedLinePlan::Replace("» hello".into())
+        );
+    }
+
+    #[test]
+    fn queued_line_erases_when_display_clears() {
+        let state = QueuedLine {
+            shown: Some("» hi".into()),
+            mid_line: false,
+            last_output: None,
+        };
+        assert_eq!(
+            queued_line_plan(&None, &state, false, 80),
+            QueuedLinePlan::Erase
+        );
+        assert_eq!(
+            queued_line_plan(&None, &QueuedLine::default(), false, 80),
+            QueuedLinePlan::Skip
+        );
+    }
+
+    #[test]
+    fn queued_line_never_draws_mid_stream() {
+        let state = QueuedLine {
+            shown: None,
+            mid_line: true,
+            last_output: Some(std::time::Instant::now()),
+        };
+        assert_eq!(
+            queued_line_plan(&Some("» hi".into()), &state, false, 80),
+            QueuedLinePlan::Skip
+        );
+    }
+
+    #[test]
+    fn queued_line_defers_to_the_thinking_spinner() {
+        let state = QueuedLine {
+            shown: Some("» hi".into()),
+            mid_line: false,
+            last_output: None,
+        };
+        assert_eq!(
+            queued_line_plan(&Some("» more".into()), &state, true, 80),
+            QueuedLinePlan::Erase
+        );
+    }
+
+    #[test]
+    fn queued_line_waits_for_the_stream_to_quiet_down() {
+        // Fresh output: the stream just moved, so even at a line start the
+        // indicator must not draw — it would blink on and off at word rate.
+        let state = QueuedLine {
+            shown: None,
+            mid_line: false,
+            last_output: Some(std::time::Instant::now()),
+        };
+        assert_eq!(
+            queued_line_plan(&Some("» hi".into()), &state, false, 80),
+            QueuedLinePlan::Skip
+        );
+        // Once output has been silent past the quiet window, drawing is
+        // allowed again.
+        let state = QueuedLine {
+            shown: None,
+            mid_line: false,
+            last_output: Some(
+                std::time::Instant::now() - QUEUED_LINE_QUIET - Duration::from_millis(1),
+            ),
+        };
+        assert_eq!(
+            queued_line_plan(&Some("» hi".into()), &state, false, 80),
+            QueuedLinePlan::Print("» hi".into())
+        );
+    }
+
+    #[test]
+    fn fit_queued_line_keeps_short_text_intact() {
+        assert_eq!(fit_queued_line("» hi", 80), "» hi");
+    }
+
+    #[test]
+    fn fit_queued_line_truncates_to_one_row_keeping_the_tail() {
+        let long = "» a fairly long typed line that exceeds a narrow terminal";
+        let fitted = fit_queued_line(long, 20);
+        assert!(console::measure_text_width(&fitted) <= 20 - 2);
+        assert!(fitted.starts_with('…'));
+        assert!(fitted.ends_with("terminal"));
     }
 
     #[test]

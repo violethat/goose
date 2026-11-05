@@ -164,7 +164,7 @@ enum DisplayState {
 }
 
 /// How long an acknowledgment note stays on the screen before fading.
-const NOTE_TTL: Duration = Duration::from_millis(2000);
+const NOTE_TTL: Duration = Duration::from_millis(10_000);
 
 /// Handle returned by [`start`] when a collector is running.
 pub struct Collector {
